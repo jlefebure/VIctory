@@ -1088,7 +1088,20 @@ fn resolve_buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
+    let first = buffer.FirstElement;
     buffer.FirstElement += offset / element;
+    // The view stays inside the host copy: past it, the host removes the
+    // device (an invalid view).
+    let remaining =
+        u32::try_from((shadow.left(address) / element).saturating_sub(first)).unwrap_or(u32::MAX);
+    buffer.NumElements = if buffer.NumElements == 0 {
+        remaining
+    } else {
+        buffer.NumElements.min(remaining)
+    };
+    if buffer.NumElements == 0 {
+        return None;
+    }
     Some((shadow, desc))
 }
 
