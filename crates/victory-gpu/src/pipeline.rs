@@ -109,13 +109,26 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        // Diagnostics: `VICTORY_DUMP_SHADERS=all|<hash>,...`
+                        // keeps translated ones too, in the same folder.
+                        #[cfg(feature = "diagnostics")]
+                        if dump_translated(&self.hash)
+                            && let Some(dir) = failed_dump_dir()
+                        {
+                            let path = dir.join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            if let Err(e) = std::fs::write(&path, &self.container) {
+                                tracing::warn!(path = %path.display(), error = %e, "VICTORY_DUMP_SHADERS: not written");
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             stage = self.stage,
@@ -138,6 +151,16 @@ impl Shader {
             })
             .as_ref()
     }
+}
+
+/// Whether `VICTORY_DUMP_SHADERS` (`all`, or hashes separated by commas)
+/// asks for the translated shader `hash` to be kept.
+#[cfg(feature = "diagnostics")]
+fn dump_translated(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| std::env::var("VICTORY_DUMP_SHADERS").ok())
+        .as_deref()
+        .is_some_and(|l| l == "all" || l.split(',').any(|h| h.trim() == hash))
 }
 
 /// The folder `VICTORY_DUMP_FAILED` names, made once and checked to be

@@ -1600,6 +1600,29 @@ impl State {
                     at,
                     bytes as usize,
                 );
+                // `VICTORY_READBACK=<address>,<bytes>`: that title buffer
+                // range too, as the GPU holds it at this execution.
+                if let Some((address, n)) = std::env::var("VICTORY_READBACK").ok().and_then(|v| {
+                    let (a, n) = v.split_once(',')?;
+                    Some((a.trim().parse::<u64>().ok()?, n.trim().parse::<u64>().ok()?))
+                }) && let Some(shadow) = crate::shadow::find(address, n)
+                    && let Some((rb, at)) = host.readback_buffer(n)
+                {
+                    // SAFETY: an open list; title buffer copies stay in the
+                    // unordered-access state between passes.
+                    unsafe {
+                        let l = &list.list;
+                        l.ResourceBarrier(&[uav_then(&shadow.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        l.CopyBufferRegion(&rb, 0, &shadow.buffer, shadow.offset(address), n);
+                        l.ResourceBarrier(&[uav_then(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                    }
+                    list.keep(&rb);
+                    list.defer_arg_log(
+                        format!("READBACK {address:#x} at {name}"),
+                        at,
+                        n as usize,
+                    );
+                }
             }
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
@@ -1866,7 +1889,11 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
+        Some(v @ View::Shader(r, d)) => texture(*r as This)
+            .map(|t| match d {
+                Some(d) => format!("{t} view f{} dim {}", d[0], d[1]),
+                None => format!("{t} view default"),
+            })
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
         // A buffer has no host texture: its title range, as for a shader view.
         Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
