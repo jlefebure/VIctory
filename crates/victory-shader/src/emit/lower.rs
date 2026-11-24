@@ -476,6 +476,8 @@ impl<'a> Lower<'a> {
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
+            // Whole-wave sections (reductions, prefix sums) run per half
+            // there, the halves' results exchanged and combined (`shape`).
             wants_console_flow = console_lanes
                 && !split
                 && x.native.wave64
@@ -483,8 +485,7 @@ impl<'a> Lower<'a> {
                 && x.target.runs(32)
                 && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
-                && !insts().any(|i| i.name().contains("permute"))
-                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+                && !insts().any(|i| i.name().contains("permute"));
             if x.console_cf {
                 console_lanes = true;
                 split = true;
@@ -905,7 +906,10 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        // In the console flow every lane of a half runs the section, so the
+        // host wave's operation is the half's; the halves then combine.
+        let halves = self.split && self.x.console_cf;
+        if self.split && !halves {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -936,11 +940,40 @@ impl<'a> Lower<'a> {
                     121,
                     &[arg, k0, k1],
                 );
-                if inclusive {
+                let r = if inclusive {
                     self.s.m.bin(c, Bin::Add, r, arg)
                 } else {
                     r
+                };
+                if halves {
+                    // The upper half's lanes count the lower half's total.
+                    let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                    let total = self.s.op(
+                        c,
+                        &format!("waveActiveOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        119,
+                        &[arg, k0, k1],
+                    );
+                    let total = if float { self.as_int(total) } else { total };
+                    let (lo, _) = self.exchange(self.cur, total);
+                    let c = self.cur;
+                    let lo = if float { self.as_float(lo) } else { lo };
+                    let zero = if float {
+                        let z = self.s.m.i32(0);
+                        self.as_float(z)
+                    } else {
+                        self.s.m.i32(0)
+                    };
+                    let (_, half) = self.console_lane();
+                    let one = self.s.m.i32(1);
+                    let upper = self.s.m.cmp(c, pred::EQ, half, one);
+                    let add = self.s.m.select(c, upper, lo, zero);
+                    let r = self.s.m.bin(c, Bin::Add, r, add);
+                    return Ok(if float { self.as_int(r) } else { r });
                 }
+                r
             }
             (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
             (Op::Or | Op::And | Op::Xor, None) => {
@@ -972,7 +1005,46 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        let r = if float { self.as_int(r) } else { r };
+        if halves {
+            // Each half's result goes to both; the console wave's is the two
+            // combined by the same operation.
+            let (lo, hi) = self.exchange(self.cur, r);
+            return Ok(self.combine(op, lo, hi));
+        }
+        Ok(r)
+    }
+
+    /// `op` of two dwords (floats as their bits), for combining two halves'
+    /// wave reductions.
+    fn combine(&mut self, op: super::wave::Op, a: V, b: V) -> V {
+        use super::wave::Op;
+        let c = self.cur;
+        let int = |l: &mut Self, code: u32| {
+            let i32t = l.s.t.i32;
+            l.s.op(c, "binary.i32", Attr::ReadNone, i32t, code, &[a, b])
+        };
+        match op {
+            Op::AddU => self.s.m.bin(c, Bin::Add, a, b),
+            Op::Or => self.s.m.bin(c, Bin::Or, a, b),
+            Op::And => self.s.m.bin(c, Bin::And, a, b),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, a, b),
+            // DXIL IMax 37, IMin 38, UMax 39, UMin 40.
+            Op::MaxI => int(self, 37),
+            Op::MinI => int(self, 38),
+            Op::MaxU => int(self, 39),
+            Op::MinU => int(self, 40),
+            Op::AddF | Op::MinF | Op::MaxF => {
+                let (fa, fb) = (self.as_float(a), self.as_float(b));
+                let r = match op {
+                    Op::AddF => self.s.m.bin(c, Bin::Add, fa, fb),
+                    // DXIL FMax 35, FMin 36.
+                    Op::MaxF => self.binary(35, fa, fb),
+                    _ => self.binary(36, fa, fb),
+                };
+                self.as_int(r)
+            }
+        }
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
