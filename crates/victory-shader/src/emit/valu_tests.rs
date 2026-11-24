@@ -158,6 +158,7 @@ fn build_cs(body: &[u32], lds_blocks: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         console_waves: false,
         stride_table: lowered.stride_table,
+        fold: lowered.fold,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1048,6 +1049,7 @@ fn root_view_reads_stop_at_the_bound_size() {
         root_srvs: lowered.root_srvs,
         console_waves: false,
         stride_table: lowered.stride_table,
+        fold: lowered.fold,
         root_uavs: lowered.root_uavs,
     };
     assert_eq!(shader.root_srvs, [2]);
@@ -1198,6 +1200,7 @@ fn build_wave32_cs(body: &[u32]) -> HostShader {
         root_srvs: lowered.root_srvs,
         console_waves: false,
         stride_table: lowered.stride_table,
+        fold: lowered.fold,
         root_uavs: lowered.root_uavs,
     };
 
@@ -1627,6 +1630,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_uavs: slots.to_vec(),
             console_waves: false,
             stride_table: false,
+            fold: false,
         }
     };
 

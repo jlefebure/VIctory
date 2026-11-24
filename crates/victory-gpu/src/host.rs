@@ -313,6 +313,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Dispatch fold widths ([`HostList::fold`]): dword 0 stays 0, the
+    /// others go to the list's dispatches in order.
+    folds: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -437,6 +440,8 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Fold-width dwords handed out since the reset (dword 0 excluded).
+    folds_used: u32,
     /// Indirect arguments read back for the log once the list has run:
     /// what they are for, the mapped readback copy, its bytes.
     #[cfg(feature = "diagnostics")]
@@ -590,6 +595,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                folds: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1312,6 +1318,51 @@ impl HostList {
                 .copies
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
+        // SAFETY: a live buffer.
+        Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A dword of the list's fold buffer for one dispatch, and its host GPU
+    /// address: the fold width the dispatch's group ids follow (see
+    /// `victory_shader::emit::FOLD_SPACE`). `width` is written when the
+    /// list is submitted; `None` leaves the dword to the GPU (the argument
+    /// clamp writes it). Width 0, or no dword left: dword 0 (always 0: not
+    /// folded) and `None` as the index.
+    pub(crate) fn fold(&self, width: Option<u32>) -> Option<(u64, Option<u32>)> {
+        const DWORDS: u32 = 1 << 14;
+        let (buffer, data) = self
+            .folds
+            .get_or_init(|| {
+                let (b, d) = host()?.shared_buffer(u64::from(DWORDS) * 4)?;
+                // SAFETY: the mapped buffer's first dword, before any use.
+                unsafe { d.cast::<u32>().write_volatile(0) };
+                Some((b, d as usize))
+            })
+            .as_ref()?;
+        // SAFETY: a live buffer.
+        let base = unsafe { buffer.GetGPUVirtualAddress() };
+        if width == Some(0) {
+            return Some((base, None));
+        }
+        let mut deferred = self.deferred();
+        if deferred.folds_used + 1 >= DWORDS {
+            return Some((base, None));
+        }
+        deferred.folds_used += 1;
+        let k = deferred.folds_used;
+        if let Some(w) = width {
+            let at = *data + 4 * k as usize;
+            // SAFETY: the list's own mapped dword, written before it runs.
+            deferred
+                .copies
+                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(w) })));
+        }
+        Some((base + 4 * u64::from(k), Some(k)))
+    }
+
+    /// The host address of the list's fold buffer (its dword 0).
+    pub(crate) fn folds_base(&self) -> Option<u64> {
+        let (buffer, _) = self.folds.get()?.as_ref()?;
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }

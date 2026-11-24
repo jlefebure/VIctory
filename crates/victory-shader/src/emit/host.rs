@@ -15,6 +15,10 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// Root signatures with a dispatch fold parameter (`t0` in
+    /// [`super::FOLD_SPACE`]), by address, and its index: dispatches bind
+    /// it to a zero dword (not folded).
+    folds: std::sync::Mutex<Vec<(usize, u32)>>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -159,7 +163,10 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host {
+                device,
+                folds: std::sync::Mutex::default(),
+            })
         }
     }
 
@@ -218,7 +225,8 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
-        let stride = usize::from(stages.iter().any(|(s, _)| s.stride_table));
+        let stride = usize::from(stages.iter().any(|(s, _)| s.stride_table))
+            + usize::from(stages.iter().any(|(s, _)| s.fold));
         let cbv = super::user_data_in_cbv(
             stages.iter().map(|(s, _)| s.user_data_dwords().max(1)),
             views.len() + stride,
@@ -281,6 +289,20 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let fold = stages.iter().any(|(s, _)| s.fold).then(|| {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::FOLD_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            params.len() as u32 - 1
+        });
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -327,7 +349,14 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            if let Some(param) = fold {
+                self.folds
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((root.as_raw() as usize, param));
+            }
+            Ok(root)
         }
     }
 
@@ -653,6 +682,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         console_waves: false,
         stride_table: false,
+        fold: false,
         root_uavs: Vec::new(),
     }
 }
@@ -1498,6 +1528,18 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            let fold = self
+                .folds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|f| f.0 == root.as_raw() as usize)
+                .map(|f| f.1);
+            if let Some(param) = fold {
+                let b = upload(&[0])?;
+                list.SetComputeRootShaderResourceView(param, b.GetGPUVirtualAddress());
+                keep.push(b);
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(

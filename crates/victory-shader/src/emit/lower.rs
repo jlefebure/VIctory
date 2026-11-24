@@ -84,6 +84,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub stride_table: bool,
+    pub fold: bool,
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -246,6 +247,8 @@ struct Lower<'a> {
     /// Addresses in root constants (parameter, dword) that a store or an
     /// atomic writes through: bound as root UAVs, the others as root SRVs.
     const_written: HashSet<(usize, u32)>,
+    /// A compute program's dispatch fold width, once read.
+    fold_width: Option<V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -706,6 +709,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             root_sizes: HashMap::new(),
+            fold_width: None,
             const_written: x
                 .res
                 .scalar
@@ -1417,6 +1421,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
+        let fold = self.s.fold.is_some();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
@@ -1424,6 +1429,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             stride_table,
+            fold,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1494,7 +1500,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -1560,6 +1566,41 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// Component `c` of the console's group id. A compute program's
+    /// dispatch may be folded by the host (see [`super::FOLD_SPACE`]): with
+    /// fold width `w`, the console's group x is `x + y * w` and its y is 0
+    /// (the host folds only dispatches one group high and deep).
+    fn group_id(&mut self, c: u8) -> Val {
+        if self.x.native.stage != HwStage::Cs || c == 2 {
+            return self.compute_id("groupId.i32", 94, c);
+        }
+        let w = match self.fold_width {
+            Some(w) => w,
+            None => {
+                let h = self.s.fold_handle();
+                let entry = self.s.entry;
+                let (z, u) = (self.s.m.i32(0), self.s.m.undef(self.s.t.i32));
+                let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(entry, "rawBufferLoad.f32", Attr::ReadOnly,
+                    self.s.t.res_ret, 139, &[h, z, u, mask, al]);
+                let w = self.s.m.extract(entry, r, 0);
+                let w = self.s.m.cast(entry, Cast::Bitcast, w, self.s.t.i32);
+                self.fold_width = Some(w);
+                w
+            }
+        };
+        let entry = self.s.entry;
+        let Val::I32(y) = self.compute_id("groupId.i32", 94, 1) else { unreachable!() };
+        if c == 1 {
+            let zero = self.s.m.i32(0);
+            let folded = self.s.m.cmp(entry, pred::NE, w, zero);
+            return Val::I32(self.s.m.select(entry, folded, zero, y));
+        }
+        let Val::I32(x) = self.compute_id("groupId.i32", 94, 0) else { unreachable!() };
+        let rows = self.s.m.bin(entry, Bin::Mul, y, w);
+        Val::I32(self.s.m.bin(entry, Bin::Add, x, rows))
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(

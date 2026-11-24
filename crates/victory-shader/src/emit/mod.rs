@@ -132,7 +132,7 @@ pub const CONST_VIEW_256: u8 = 0xC0;
 /// User-data indices such views can start at.
 pub const CONST_VIEWS: u8 = 0x40;
 pub use shader::{
-    ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
+    FOLD_SPACE, ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };
 
 /// The loop limit without an override: 2^20.
@@ -199,6 +199,9 @@ pub struct HostShader {
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
+    /// True when a compute program reads its group id, so the host's fold
+    /// of its dispatch (`t0` in [`FOLD_SPACE`]) must be bound.
+    pub fold: bool,
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
@@ -415,6 +418,7 @@ pub fn emit(
             && native.stage == HwStage::Ms
             && crate::uniform::first_lane_reads_vary(p, st, &[ir::Reg::V(5)]),
         stride_table: l.stride_table,
+        fold: l.fold,
         root_uavs: l.root_uavs,
     })
 }
@@ -676,6 +680,7 @@ mod tests {
             root_srvs: Vec::new(),
             console_waves: false,
             stride_table: false,
+            fold: false,
             root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -689,6 +694,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 console_waves: false,
                 stride_table: false,
+                fold: false,
                 root_uavs: Vec::new(),
             })
         };
@@ -1107,6 +1113,7 @@ mod tests {
             root_srvs: l.root_srvs,
             console_waves: false,
             stride_table: l.stride_table,
+            fold: l.fold,
             root_uavs: l.root_uavs,
         }
     }

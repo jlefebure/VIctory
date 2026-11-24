@@ -24,12 +24,18 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+// fold: the dword of `folds` that gets the fold width of a dispatch (one
+// record), 0 for none.
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint fold; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+// Fold widths: a console dispatch wider than 65,535 groups (and one group
+// high and deep) runs as width x d groups, width * d its x exactly; the
+// translated program rebuilds its group id from the width.
+RWByteAddressBuffer folds : register(u2);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
@@ -46,7 +52,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 raw = args.Load3(at);
+        uint width = 0;
+        if (fold != 0 && records == 1 && raw.x > 65535 && raw.y == 1 && raw.z == 1
+                && raw.x <= GROUPS) {
+            for (uint d = (raw.x + 65534) / 65535; d <= 65535; d++) {
+                if (raw.x % d == 0) {
+                    width = raw.x / d;
+                    raw = uint3(width, d, 1);
+                    break;
+                }
+            }
+        }
+        if (fold != 0) {
+            folds.Store(fold * 4, width);
+        }
+        uint3 g = min(raw, uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -149,6 +170,7 @@ pub(crate) fn bound(
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    fold: Option<(u64, u32)>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
@@ -157,7 +179,12 @@ pub(crate) fn bound(
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    // The fold buffer (its dword 0 when none is asked for: never written).
+    let (folds, slot) = match fold {
+        Some((base, slot)) => (base, slot),
+        None => (budget, 0),
+    };
+    let constants = [kind, stride, records, slot];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -168,6 +195,7 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, folds);
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),

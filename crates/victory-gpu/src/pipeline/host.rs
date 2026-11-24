@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{FOLD_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -261,6 +261,8 @@ pub(crate) struct Stage {
     pub(crate) root_srvs: Vec<(u8, u32)>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
+    /// Root parameter of the dispatch fold dword (`t0`, [`FOLD_SPACE`]).
+    pub(crate) fold: Option<u32>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
@@ -351,6 +353,11 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    /// The root parameter of the compute stage's dispatch fold dword.
+    pub(crate) fn fold_param(&self) -> Option<u32> {
+        self.stages.iter().find_map(|s| s.fold)
+    }
+
     pub(crate) fn has_root_uavs(&self) -> bool {
         self.stages.iter().any(|s| !s.root_uavs.is_empty())
     }
@@ -444,7 +451,7 @@ impl HostPipeline {
                 if t.user_data_dwords() > 0 {
                     dwords.push(t.user_data_dwords());
                 }
-                strides += usize::from(t.stride_table);
+                strides += usize::from(t.stride_table) + usize::from(t.fold);
             }
             views.sort_unstable();
             views.dedup();
@@ -459,6 +466,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: None,
+                fold: None,
                 root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
@@ -513,6 +521,20 @@ impl HostPipeline {
                         out.push((slot, param));
                     }
                 }
+            }
+            if t.fold {
+                stage.fold = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: FOLD_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             if t.stride_table {
                 stage.stride_table = Some(params.len() as u32);

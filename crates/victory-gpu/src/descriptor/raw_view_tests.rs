@@ -2,7 +2,7 @@
 //! ([`victory_shader::emit::StrideEntry`]), read by a translated program:
 //! the heap's own slots, entries and raw views, run on the host GPU.
 
-use victory_shader::emit::{HostShader, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE};
+use victory_shader::emit::{FOLD_SPACE, HostShader, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE};
 use victory_shader::native::{ComputeIo, StageIo};
 use victory_shader::{HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -168,6 +168,18 @@ fn pipeline(
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
+        // The dispatch fold dword (not folded here).
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: FOLD_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
     ];
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
@@ -228,6 +240,9 @@ fn dispatch(
         list.SetComputeRootSignature(root);
         list.SetComputeRoot32BitConstants(0, user_data, zeros.as_ptr().cast(), 0);
         list.SetComputeRootShaderResourceView(1, heap.stride_table_gpu().expect("a table"));
+        let (fold, data) = host().expect("a host").upload_buffer(256).expect("a buffer");
+        data.cast::<u32>().write(0);
+        list.SetComputeRootShaderResourceView(2, fold.GetGPUVirtualAddress());
         list.Dispatch(2, 1, 1);
         list.Close()?;
         queue.ExecuteCommandLists(&[Some(list.cast()?)]);

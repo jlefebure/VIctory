@@ -15,6 +15,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
 /// (one [`StrideEntry`] per view-heap slot).
 pub const STRIDE_SPACE: u32 = 2;
+/// Where a compute program reads how the host folded its dispatch: `t0` in
+/// this space, a raw buffer whose first dword is the fold width (0: not
+/// folded). D3D12 runs at most 65,535 groups per dimension; the console
+/// runs more along x, which the host spreads over x and y.
+pub const FOLD_SPACE: u32 = 3;
 
 /// What the host writes per view-heap slot in the runtime stride table, for
 /// buffers a shader reads without a stride known when it was translated.
@@ -144,6 +149,8 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
+    /// The dispatch fold buffer's handle, once read (`t0` in [`FOLD_SPACE`]).
+    pub fold: Option<V>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
@@ -206,6 +213,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: None,
+            fold: None,
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -358,6 +366,30 @@ impl Shader {
         h
     }
 
+    /// The handle of the dispatch fold buffer (`t0` in [`FOLD_SPACE`]).
+    pub fn fold_handle(&mut self) -> V {
+        if let Some(h) = self.fold {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(FOLD_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.fold = Some(h);
+        h
+    }
+
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
@@ -465,6 +497,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || self.stride_table.is_some()
+            || self.fold.is_some()
             || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
@@ -520,7 +553,7 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() || self.stride_table.is_some() {
+            if !self.root_srvs.is_empty() || self.stride_table.is_some() || self.fold.is_some() {
                 let mut specs: Vec<(u32, u32)> = self
                     .root_srvs
                     .iter()
@@ -528,6 +561,9 @@ impl Shader {
                     .collect();
                 if self.stride_table.is_some() {
                     specs.push((STRIDE_SPACE, 0));
+                }
+                if self.fold.is_some() {
+                    specs.push((FOLD_SPACE, 0));
                 }
                 let ty = self
                     .m

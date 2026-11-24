@@ -229,6 +229,18 @@ fn uav_then(
     }
 }
 
+/// A dispatch of `x` groups (one high and deep) past the host's 65,535
+/// per dimension as `(width, d)` with `width * d == x`, both within it.
+/// shortcut: an `x` with no such factors stays unfolded (and is dropped).
+fn fold_split(x: u32, y: u32, z: u32) -> Option<(u32, u32)> {
+    if x <= 65535 || y != 1 || z != 1 {
+        return None;
+    }
+    (x.div_ceil(65535)..=65535)
+        .find(|d| x.is_multiple_of(*d))
+        .map(|d| (x / d, d))
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. Constant buffers refresh up to the D3D12 64 KiB
@@ -925,12 +937,36 @@ impl State {
             );
             return;
         }
+        // Past 65,535 groups along x: folded over x and y, the program
+        // rebuilds the console's group ids from the width it reads.
+        let (hx, hy) = match p.fold_param() {
+            Some(param) => {
+                let (width, (hx, hy)) = match fold_split(x, y, z) {
+                    Some((w, d)) => (w, (w, d)),
+                    None => (0, (x, y)),
+                };
+                let Some((gpu, _)) = list.fold(Some(width)) else {
+                    once!("no fold buffer; a dispatch dropped");
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                // SAFETY: an open list; the fold buffer lives with it.
+                unsafe { list.list.SetComputeRootShaderResourceView(param, gpu) };
+                (hx, hy)
+            }
+            None => (x, y),
+        };
+        if hx > 65535 || hy > 65535 || z > 65535 {
+            once!(x, y, z, "a dispatch past the host's 65,535 groups per dimension dropped");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, true);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(hx, hy, z) };
         if p.has_root_uavs() {
             emit_uav_barrier(list);
         }
@@ -1567,7 +1603,28 @@ impl State {
             }
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // A dispatch of one record whose program reads its group ids: the
+        // clamp folds it past 65,535 groups and writes the width it chose.
+        let fold_param = (kind == DISPATCH)
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
+            .flatten()
+            .and_then(|p| p.fold_param());
+        let fold = match fold_param {
+            Some(_) if max == 1 => list.fold(None),
+            Some(_) => list.fold(Some(0)),
+            None => None,
+        };
+        let clamp_fold = match (fold, list.folds_base()) {
+            (Some((_, Some(slot))), Some(base)) => Some((base, slot)),
+            _ => None,
+        };
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            clamp_fold,
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             #[cfg(feature = "diagnostics")]
             self.frame_op_why(
@@ -1633,7 +1690,18 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(p) if p.compute => {
+                    let bound = self.bind(list, p, true);
+                    match (bound, fold_param, fold) {
+                        (true, Some(param), Some((gpu, _))) => {
+                            // SAFETY: an open list; the fold buffer lives with it.
+                            unsafe { list.list.SetComputeRootShaderResourceView(param, gpu) };
+                            true
+                        }
+                        (true, Some(_), None) => false,
+                        (bound, ..) => bound,
+                    }
+                }
                 _ => false,
             },
             _ => false,
@@ -2291,5 +2359,18 @@ mod tests {
 
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
+    }
+
+    /// Wide dispatches fold exactly (the lighting pass's 115,200 groups as
+    /// 57,600 x 2); others, and ones with no fitting factors, do not.
+    #[test]
+    fn wide_dispatches_fold_exactly() {
+        assert_eq!(super::fold_split(115_200, 1, 1), Some((57_600, 2)));
+        assert_eq!(super::fold_split(65_535, 1, 1), None);
+        assert_eq!(super::fold_split(115_200, 2, 1), None);
+        // A prime past 65,535 has no factors within the limit.
+        assert_eq!(super::fold_split(65_537, 1, 1), None);
+        let (w, d) = super::fold_split(1 << 20, 1, 1).unwrap();
+        assert!(w <= 65_535 && d <= 65_535 && w * d == 1 << 20);
     }
 }

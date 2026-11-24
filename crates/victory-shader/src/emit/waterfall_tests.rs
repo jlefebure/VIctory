@@ -101,6 +101,7 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         root_srvs: lowered.root_srvs,
         console_waves: false,
         stride_table: lowered.stride_table,
+        fold: lowered.fold,
         root_uavs: lowered.root_uavs,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
