@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::emit::{CONST_VIEW, UserData};
+use victory_shader::emit::{CONST_VIEW, CONST_VIEW_256, UserData};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -547,7 +547,8 @@ impl State {
 
     /// The address root view `slot` of a shader reading `user_data` binds:
     /// a title root view's, or for [`CONST_VIEW`] and up the address in the
-    /// two dwords of root constants at user-data index `slot - CONST_VIEW`.
+    /// two dwords of root constants at user-data index `slot - CONST_VIEW`
+    /// ([`CONST_VIEW_256`] and up: one dword, shifted left by 8).
     /// `None` for a root view the title did not set.
     fn root_address(&self, compute: bool, user_data: &[UserData], slot: u8) -> Option<u64> {
         if slot < CONST_VIEW {
@@ -556,13 +557,16 @@ impl State {
                 _ => None,
             };
         }
-        let low = u32::from(slot - CONST_VIEW);
         let dword = |index: u32| {
             let u = user_data
                 .iter()
                 .find(|u| u.index == index && u.root == RootType::Constants)?;
             Some(self.user_value(compute, u.slot, RootType::Constants, u.dword))
         };
+        if slot >= CONST_VIEW_256 {
+            return Some(u64::from(dword(u32::from(slot - CONST_VIEW_256))?) << 8);
+        }
+        let low = u32::from(slot - CONST_VIEW);
         Some(u64::from(dword(low)?) | u64::from(dword(low + 1)?) << 32)
     }
 

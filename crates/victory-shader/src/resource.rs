@@ -34,6 +34,10 @@ pub struct Address {
     /// For root constants, the dword of the parameter that holds the
     /// address's low half (the next one holds its high half); else 0.
     pub word: u32,
+    /// For root constants, 0 when two dwords hold the address, or 8 when
+    /// dword `word` alone holds it shifted right by 8 (a 256-byte aligned
+    /// 40-bit address); else 0.
+    pub shift: u8,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -485,8 +489,43 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        // Through `v_readfirstlane_b32` only to a base: as a computed term
+        // the scalar value stands (waterfall loops compare against it).
         if let Some(x) = self.first_lane_of(v) {
-            return self.sum(x);
+            let through = self.sum(x);
+            if through.base.is_some() {
+                return through;
+            }
+        }
+        if self.shifted(v).is_some() {
+            return Sum {
+                base: Some(v),
+                offset: 0,
+                dynamic: None,
+            };
+        }
+        // `s_or_b32` of a shifted address and bits below the shift: an add.
+        if let Some(inst) = self.def(v)
+            && inst.name() == "s_or_b32"
+            && inst.writes.first().is_some_and(|w| w.1 == v)
+            && let Fields::Sop { src, .. } = &inst.fields
+            && let (Some(a), Some(b)) = (
+                src.first().and_then(|o| self.term(inst, o)),
+                src.get(1).and_then(|o| self.term(inst, o)),
+            )
+        {
+            for (x, c) in [(a, b), (b, a)] {
+                if let (Term::Value(x), Term::Const(c)) = (x, c)
+                    && let Some((_, k, _)) = self.shifted(x)
+                    && u64::from(c) < 1 << k
+                {
+                    return Sum {
+                        base: Some(x),
+                        offset: c,
+                        dynamic: None,
+                    };
+                }
+            }
         }
         let dynamic = Sum {
             base: None,
@@ -673,6 +712,24 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
                 word: 0,
+                shift: 0,
+            });
+        }
+        if let Some((input, shift, high)) = self.shifted(base) {
+            let reg = self.inputs[input.0 as usize].ok_or("an address not from a root parameter")?;
+            let (param, word) = self.param_of(reg).ok_or("an address not from a root parameter")?;
+            if shift != 8 {
+                return Err("an address in root constants shifted other than by 8");
+            }
+            if hi != Term::Value(high) && !self.carried(hi, high) {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+                word,
+                shift: 8,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -708,6 +765,7 @@ impl<'a> Tracer<'a> {
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
             word,
+            shift: 0,
         })
     }
 
@@ -757,6 +815,30 @@ impl<'a> Tracer<'a> {
             return None;
         };
         self.vterm(inst, f.src.first()?)
+    }
+
+    /// For the low dword `v` of `s_lshl_b64` of a root-constants dword
+    /// (zero-extended) by a constant: that dword, the shift, and the high
+    /// dword the shift writes.
+    fn shifted(&self, v: Value) -> Option<(Value, u32, Value)> {
+        let inst = self.def(v)?;
+        if inst.name() != "s_lshl_b64" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let Operand::Scalar { code, .. } = *src.first()? else {
+            return None;
+        };
+        let lo = self.origin(inst.read(Reg::S(code))?);
+        let hi = self.origin(inst.read(Reg::S(code + 1))?);
+        let (Term::Value(x), Term::Const(0), Some(Term::Const(k))) =
+            (lo, hi, self.term(inst, src.get(1)?))
+        else {
+            return None;
+        };
+        (k < 32 && self.constants_input(x)).then_some((x, k, inst.writes.get(1)?.1))
     }
 
     /// `v` is a user SGPR of root constants.
@@ -1823,6 +1905,7 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
             word: 0,
+            shift: 0,
         }
     }
 
@@ -1846,6 +1929,36 @@ pub(crate) mod tests {
                 Address {
                     word: 2,
                     ..at(0, 8)
+                }
+            )]
+        );
+    }
+
+    /// One root-constants dword holding a 256-byte aligned address shifted
+    /// right by 8 (`s4`, dword 0), widened and shifted back, with an offset
+    /// or-ed into the bits below the shift.
+    #[test]
+    fn an_address_shifted_in_one_root_constant() {
+        let r = track_words(
+            &[
+                0xBE86_0304, // s_mov_b32 s6, s4
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0x8F86_8806, // s_lshl_b64 s[6:7], s[6:7], 8
+                0x8806_8C06, // s_or_b32 s6, s6, 12
+                0xF400_0003,
+                0xFA00_0000, // s_load_dword s0, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 4, 2)],
+            HwStage::Ps,
+        );
+        assert_eq!(
+            r.scalar,
+            [(
+                (0, 4),
+                Address {
+                    shift: 8,
+                    ..at(0, 12)
                 }
             )]
         );

@@ -35,7 +35,8 @@
 //!   a root SRV or UAV too, register [`CONST_VIEW`] plus the user-data
 //!   index of its low dword: the shader declares it reads both dwords
 //!   ([`HostShader::user_data`]), so the host rebuilds the address from
-//!   them. Its size takes a user-data dword past every root argument's (a
+//!   them; one dword holding the address shifted right by 8 is register
+//!   [`CONST_VIEW_256`] plus its index. Its size takes a user-data dword past every root argument's (a
 //!   `Descriptor` entry whose slot is the view's register).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
@@ -121,9 +122,15 @@ pub fn user_data_in_cbv(user_dwords: impl IntoIterator<Item = u32>, descriptors:
     constants + 2 * descriptors as u32 > 64
 }
 
-/// The first root view register of an address in root constants (see the
-/// module notes); title root parameter indices stay below it.
+/// The first root view register of an address in two dwords of root
+/// constants (see the module notes); title root parameter indices stay
+/// below it.
 pub const CONST_VIEW: u8 = 0x80;
+/// The first root view register of an address in one dword of root
+/// constants, shifted right by 8 (256-byte aligned).
+pub const CONST_VIEW_256: u8 = 0xC0;
+/// User-data indices such views can start at.
+pub const CONST_VIEWS: u8 = 0x40;
 pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };

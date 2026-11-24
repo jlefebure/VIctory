@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::{CONST_VIEW, UserData};
+use super::{CONST_VIEW, CONST_VIEW_256, CONST_VIEWS, UserData};
 use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
@@ -1777,17 +1777,24 @@ impl<'a> Lower<'a> {
     }
 
     /// For an address in root constants, the register of its root view
-    /// ([`CONST_VIEW`] plus the user-data index of its low dword). The host
-    /// rebuilds the address from the two dwords, which the shader declares
-    /// it reads so the host knows where they are.
+    /// ([`CONST_VIEW`] plus the user-data index of its low dword, or
+    /// [`CONST_VIEW_256`] plus the index of a dword holding it shifted right
+    /// by 8). The host rebuilds the address from the dwords, which the
+    /// shader declares it reads so the host knows where they are.
     fn const_view_id(&mut self, address: &Address) -> Option<u8> {
         let rp = *self.x.native.layout.get(address.param)?;
-        if rp.root != RootType::Constants || address.word + 1 >= rp.sgprs {
+        // One dword holds an address shifted right by 8, else two hold it.
+        let (dwords, first) = match address.shift {
+            8 => (1, CONST_VIEW_256),
+            0 => (2, CONST_VIEW),
+            _ => return None,
+        };
+        if rp.root != RootType::Constants || address.word + dwords > rp.sgprs {
             return None;
         }
         let low = u32::from(rp.user_data) + address.word;
-        let id = u8::try_from(low).ok().filter(|&l| l < CONST_VIEW)? | CONST_VIEW;
-        for k in 0..2 {
+        let id = u8::try_from(low).ok().filter(|&l| l < CONST_VIEWS)? | first;
+        for k in 0..dwords {
             let index = low + k;
             self.user_reads.entry(index).or_insert(UserData {
                 index,
