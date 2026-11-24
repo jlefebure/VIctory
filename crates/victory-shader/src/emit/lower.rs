@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
+use super::{CONST_VIEW, UserData};
 use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
@@ -242,7 +242,10 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Bytes each root view holds, by root parameter (see [`Self::root_view_size`]).
-    root_sizes: HashMap<usize, V>,
+    root_sizes: HashMap<(usize, u32), V>,
+    /// Addresses in root constants (parameter, dword) that a store or an
+    /// atomic writes through: bound as root UAVs, the others as root SRVs.
+    const_written: HashSet<(usize, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -703,6 +706,20 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             root_sizes: HashMap::new(),
+            const_written: x
+                .res
+                .scalar
+                .iter()
+                .filter(|(site, a)| {
+                    a.param != CODE
+                        && x.native.layout.get(a.param).map(|r| r.root) == Some(RootType::Constants)
+                        && {
+                            let name = p.blocks[site.0].insts[site.1].name();
+                            name.contains("_store") || name.contains("_atomic")
+                        }
+                })
+                .map(|(_, a)| (a.param, a.word))
+                .collect(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -820,6 +837,105 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
+    /// A 32-bit `global_atomic_<op>` on the root UAV at the address the title
+    /// sets, when the dword lies in the view (RDNA 2 ISA section 12.14).
+    /// `fmin`/`fmax` order as the hardware's `v_min_f32`/`v_max_f32` do,
+    /// through a compare-exchange loop.
+    fn global_atomic(&mut self, inst: &Inst, b: usize, i: usize, op: &str) -> Result<(), Why> {
+        let Fields::Flat { dst, data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        if op.ends_with("_x2") {
+            return Err("a 64-bit global atomic");
+        }
+        let a = *self
+            .scalar
+            .get(&(b, i))
+            .ok_or("an untracked global address")?;
+        if a.param == CODE {
+            return Err("a global atomic on the program's code");
+        }
+        let native = match op {
+            "add" | "sub" => Some(0),
+            "and" => Some(1),
+            "or" => Some(2),
+            "xor" => Some(3),
+            "smin" => Some(4),
+            "smax" => Some(5),
+            "umin" => Some(6),
+            "umax" => Some(7),
+            "swap" => Some(8),
+            "cmpswap" | "inc" | "dec" | "fmin" | "fmax" => None,
+            _ => return Err("a global atomic"),
+        };
+        let guard = self.guard(b, i)?;
+        let d = data.as_ref().ok_or("a global atomic value")?;
+        let vals = self.vgprs(inst, d, if op == "cmpswap" { 2 } else { 1 })?;
+        let c = self.cur;
+        let mut off = self.s.m.i32(a.offset);
+        if let Some(x) = a.dynamic {
+            let x = self.i32_of(x)?;
+            off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let (off, ok) = match self.root_view_size(&src) {
+            Some(size) => {
+                let (ok, at) = self.in_root_view(size, off, 4);
+                (at, Some(ok))
+            }
+            None => (off, None),
+        };
+        let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+        let iu = self.s.m.undef(self.s.t.i32);
+        let coords = [off, iu, iu];
+        let zero = self.s.m.i32(0);
+        let val = vals[0];
+        let active = self.narrow(guard, ok);
+        let at = self.begin_guarded(active);
+        let r = match (op, native) {
+            // cmpswap: data is (new, compare).
+            ("cmpswap", _) => self.buffer_compare_exchange(h, coords, vals[1], val, false),
+            (_, Some(code)) => {
+                let code = self.s.m.i32(code);
+                let data = if op == "sub" {
+                    self.s.m.bin(self.cur, Bin::Sub, zero, val)
+                } else {
+                    val
+                };
+                let ty = self.s.t.i32;
+                self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, ty, 78,
+                    &[h, code, coords[0], coords[1], coords[2], data])
+            }
+            ("fmin" | "fmax", _) => self.atomic_update(zero, |l, old| {
+                let (x, y) = (l.as_float(old), l.as_float(val));
+                let m = l.max_min(op == "fmax", x, y);
+                let new = l.as_int(m);
+                l.buffer_compare_exchange(h, coords, old, new, false)
+            }),
+            _ => {
+                let update = if op == "inc" { AtomicUpdate::Inc } else { AtomicUpdate::Dec };
+                self.atomic_update(zero, |l, old| {
+                    let new = l.atomic_new_value(update, old, val, zero);
+                    l.buffer_compare_exchange(h, coords, old, new, false)
+                })
+            }
+        };
+        match *dst {
+            Some(Operand::Vector { reg, .. }) => {
+                let r = self.end_guarded(at, &[(r, zero)])[0];
+                self.write_atomic_result(inst, reg, r, false, guard);
+            }
+            _ => {
+                self.end_guarded(at, &[]);
+            }
+        }
+        Ok(())
+    }
+
     /// A global memory access (`global_load_*`, `global_store_*`): from the
     /// program's constant table, or from a root SRV/UAV at the address the
     /// title sets.
@@ -879,9 +995,12 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
+        if let Some(op) = name.strip_prefix("global_atomic_") {
+            return self.global_atomic(inst, b, i, op);
+        }
         let rest = name
             .strip_prefix("global_load_")
-            .ok_or("a global store or atomic without root UAV address support")?;
+            .ok_or("a global store without root UAV address support")?;
         let sub = subword_load(rest);
         let n = match rest {
             "dword" => 1,
@@ -1597,18 +1716,38 @@ impl<'a> Lower<'a> {
             return None;
         }
         let rp = *self.x.native.layout.get(address.param)?;
-        if rp.root != RootType::Descriptor {
-            return None;
-        }
-        if let Some(&v) = self.root_sizes.get(&address.param) {
+        let key = (address.param, address.word);
+        if let Some(&v) = self.root_sizes.get(&key) {
             return Some(v);
         }
-        let index = u32::from(rp.user_data);
+        let (index, slot) = match rp.root {
+            RootType::Descriptor => (u32::from(rp.user_data), rp.slot),
+            // The size of a view at an address in root constants takes a
+            // user-data dword past every root argument's.
+            RootType::Constants => {
+                let id = self.const_view_id(address)?;
+                let past = self
+                    .x
+                    .native
+                    .layout
+                    .iter()
+                    .map(|r| u32::from(r.user_data) + r.sgprs)
+                    .max()
+                    .unwrap_or(0);
+                let taken = self
+                    .user_reads
+                    .values()
+                    .filter(|u| u.root == RootType::Descriptor && u.slot >= CONST_VIEW)
+                    .count() as u32;
+                (past + taken, id)
+            }
+            _ => return None,
+        };
         self.user_reads.insert(
             index,
             UserData {
                 index,
-                slot: rp.slot,
+                slot,
                 root: RootType::Descriptor,
                 dword: 0,
             },
@@ -1633,8 +1772,32 @@ impl<'a> Lower<'a> {
             &[h, row],
         );
         let v = self.s.m.extract(entry, r, index % 4);
-        self.root_sizes.insert(address.param, v);
+        self.root_sizes.insert(key, v);
         Some(v)
+    }
+
+    /// For an address in root constants, the register of its root view
+    /// ([`CONST_VIEW`] plus the user-data index of its low dword). The host
+    /// rebuilds the address from the two dwords, which the shader declares
+    /// it reads so the host knows where they are.
+    fn const_view_id(&mut self, address: &Address) -> Option<u8> {
+        let rp = *self.x.native.layout.get(address.param)?;
+        if rp.root != RootType::Constants || address.word + 1 >= rp.sgprs {
+            return None;
+        }
+        let low = u32::from(rp.user_data) + address.word;
+        let id = u8::try_from(low).ok().filter(|&l| l < CONST_VIEW)? | CONST_VIEW;
+        for k in 0..2 {
+            let index = low + k;
+            self.user_reads.entry(index).or_insert(UserData {
+                index,
+                slot: rp.slot,
+                root: RootType::Constants,
+                dword: address.word + k,
+            });
+            self.s.user_data = self.s.user_data.max(index + 1);
+        }
+        Some(id)
     }
 
     /// Whether `bytes` bytes at byte `off` lie in a root view of `size`
@@ -3791,7 +3954,11 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let root_desc = self.scalar.get(&site).copied().and_then(|a| {
-            (self.x.native.layout.get(a.param)?.root == RootType::Descriptor).then_some(
+            matches!(
+                self.x.native.layout.get(a.param)?.root,
+                RootType::Descriptor | RootType::Constants
+            )
+            .then_some(
                 Source::Built {
                     address: a,
                     bits: 0,
@@ -3857,10 +4024,14 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(
-            kind,
-            Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
-        ) {
+        let in_constants = matches!(src, Source::Built { address, .. }
+            if self.x.native.layout.get(address.param).map(|r| r.root) == Some(RootType::Constants));
+        if in_constants
+            || matches!(
+                kind,
+                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+            )
+        {
             let u = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
                 0x1000
             } else {
@@ -4383,6 +4554,17 @@ impl<'a> Lower<'a> {
                     .layout
                     .get(address.param)
                     .ok_or("a descriptor built around a table in the code")?;
+                if rp.root == RootType::Constants {
+                    let id = self
+                        .const_view_id(address)
+                        .ok_or("an address in root constants")?;
+                    let written = self.const_written.contains(&(address.param, address.word));
+                    return match props.0 {
+                        11 if !written => Ok(self.s.root_srv_handle(id)),
+                        11 | 0x100B => Ok(self.s.root_uav_handle(id)),
+                        _ => Err("a typed view at an address in root constants"),
+                    };
+                }
                 let kind = self
                     .x
                     .native
@@ -7599,6 +7781,23 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A root view is a raw buffer on the host: an indexed access reads
+        // the bytes at `index * stride` (the stride its descriptor was
+        // built with), checked against the view's size as raw ones are.
+        let index = match index {
+            Some(i)
+                if matches!(src, Source::Built { address, .. } if address.param != CODE)
+                    && stride >= 4
+                    && stride.is_multiple_of(4)
+                    && !typed =>
+            {
+                let st = self.s.m.i32(stride);
+                let rows = self.s.m.bin(c, Bin::Mul, i, st);
+                off = self.s.m.bin(c, Bin::Add, rows, off);
+                None
+            }
+            i => i,
+        };
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);

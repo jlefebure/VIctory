@@ -31,6 +31,12 @@
 //!   `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the title's root
 //!   parameter index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
 //!   [`HostShader::root_uavs`]); the address the title sets is the buffer's.
+//!   A 64-bit address the title passes in two dwords of root constants is
+//!   a root SRV or UAV too, register [`CONST_VIEW`] plus the user-data
+//!   index of its low dword: the shader declares it reads both dwords
+//!   ([`HostShader::user_data`]), so the host rebuilds the address from
+//!   them. Its size takes a user-data dword past every root argument's (a
+//!   `Descriptor` entry whose slot is the view's register).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -105,6 +111,19 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
+
+/// Whether a root signature binds each stage's user data as a root CBV
+/// rather than root constants: when constants of `user_dwords` (per stage)
+/// and `descriptors` root descriptors (2 dwords each) would pass D3D12's
+/// 64-dword root signature limit. The shader reads `b0` the same either way.
+pub fn user_data_in_cbv(user_dwords: impl IntoIterator<Item = u32>, descriptors: usize) -> bool {
+    let constants: u32 = user_dwords.into_iter().sum();
+    constants + 2 * descriptors as u32 > 64
+}
+
+/// The first root view register of an address in root constants (see the
+/// module notes); title root parameter indices stay below it.
+pub const CONST_VIEW: u8 = 0x80;
 pub use shader::{
     ROOT_CBV_SPACE, RawWindow, SAMPLER_SPACE, STRIDE_SPACE, StrideEntry, USER_DATA_SPACE,
 };

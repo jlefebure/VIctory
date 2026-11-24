@@ -125,7 +125,7 @@ const SPILL_FIRST: u8 = 16;
 /// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
 /// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
 /// the user SGPRs the table's dwords stand for. Only loads with a constant
-/// offset, in code no branch joins after the pointer is set up, are rewritten.
+/// offset through a pointer every way to the load keeps are rewritten.
 ///
 /// The table holds the arguments as they were on entry, but the program may
 /// have written the SGPRs those dwords stand for by the time it loads them
@@ -140,6 +140,7 @@ fn spill_loads(
     code_len: usize,
 ) -> Result<Vec<Instruction>, ShaderError> {
     use gfx10::Fields::{Smem, Sop, Valu};
+    let mut flows = Vec::with_capacity(list.len());
     let mut targets = std::collections::BTreeSet::new();
     for inst in list.iter() {
         let flow = gfx10::control(inst, code_len, |at| {
@@ -148,6 +149,7 @@ fn spill_loads(
         if let Flow::Jump(t) | Flow::Branch(t) = flow {
             targets.insert(t);
         }
+        flows.push(flow);
     }
     let Some(entry) = list.first().map(|i| i.offset) else {
         return Ok(list);
@@ -179,25 +181,17 @@ fn spill_loads(
             }
         }
     }
-    let original = list.clone();
-    // Where each rewritten copy is in `out`, and the user SGPR it stands for.
-    let mut copies: Vec<(usize, u8)> = Vec::new();
-    // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
-    let mut tag = [0u8; 128];
-    tag[0] = 1;
-    tag[1] = 2;
-    let mut out = Vec::with_capacity(list.len());
     let scalar = |o: &Operand| match *o {
         Operand::Scalar { code, dwords } if code < 106 => Some((code, dwords.max(1))),
         _ => None,
     };
-    for inst in list {
-        if targets.contains(&inst.offset) {
-            tag = [0; 128];
-        }
+    // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
+    // A load of the table `inst` makes from the tags: (its first register,
+    // dwords, the first user SGPR they stand for); else what `inst` does to
+    // the tags.
+    let step = |inst: &Instruction, tag: &mut [u8; 128]| -> Option<(u8, u8, u32)> {
         let f = inst.fields(wave64);
         let name = inst.name().unwrap_or("");
-        // The load of the table.
         if let Smem {
             data: Some(ref d),
             ref base,
@@ -217,17 +211,11 @@ fn spill_loads(
             let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
             if first + u32::from(n) <= 105 {
                 for k in 0..n {
-                    let src = (first + u32::from(k)) as u8;
-                    copies.push((out.len(), src));
-                    out.push(s_mov(dst + k, src, inst.offset)?);
-                }
-                for k in 0..n {
                     tag[(dst + k) as usize] = 0;
                 }
-                continue;
+                return Some((dst, n, first));
             }
         }
-        // What this instruction does to the tracked registers.
         let mut written: Vec<(u8, u8)> = Vec::new();
         match &f {
             Sop {
@@ -273,6 +261,77 @@ fn spill_loads(
             for k in c..c.saturating_add(n).min(128) {
                 tag[k as usize] = 0;
             }
+        }
+        None
+    };
+    // The tags at each branch target: what every jump to it and the
+    // fall-through agree on (a register keeps its tag only if every way in
+    // keeps it), found by passes over the code until no target's tags
+    // change. A jump not seen yet (a loop's back edge on the first pass)
+    // takes no part until a pass records it.
+    let meet = |a: &mut [u8; 128], b: &[u8; 128]| {
+        for (x, y) in a.iter_mut().zip(b) {
+            if x != y {
+                *x = 0;
+            }
+        }
+    };
+    let enter = |tag: &mut [u8; 128], live: bool, jumps: Option<&[u8; 128]>| match (live, jumps) {
+        (true, Some(t)) => meet(tag, t),
+        (false, Some(t)) => *tag = *t,
+        (true, None) => {}
+        (false, None) => *tag = [0; 128],
+    };
+    let mut start = [0u8; 128];
+    start[0] = 1;
+    start[1] = 2;
+    let mut at_target: std::collections::BTreeMap<usize, [u8; 128]> = Default::default();
+    // Tags only ever clear, so this settles; the bound is a safety net (an
+    // unsettled result keeps the code as it is).
+    let mut settled = false;
+    for _ in 0..64 {
+        let mut changed = false;
+        let mut tag = start;
+        let mut live = true;
+        for (inst, flow) in list.iter().zip(&flows) {
+            if targets.contains(&inst.offset) {
+                enter(&mut tag, live, at_target.get(&inst.offset));
+            }
+            step(inst, &mut tag);
+            if let Flow::Jump(t) | Flow::Branch(t) = *flow {
+                let jumps = at_target.entry(t).or_insert(tag);
+                let before = *jumps;
+                meet(jumps, &tag);
+                changed |= *jumps != before;
+            }
+            live = !matches!(flow, Flow::Jump(_) | Flow::Stop);
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        return Ok(list);
+    }
+    let original = list.clone();
+    // Where each rewritten copy is in `out`, and the user SGPR it stands for.
+    let mut copies: Vec<(usize, u8)> = Vec::new();
+    let mut out = Vec::with_capacity(list.len());
+    let mut tag = start;
+    let mut live = true;
+    for (inst, flow) in list.into_iter().zip(&flows) {
+        if targets.contains(&inst.offset) {
+            enter(&mut tag, live, at_target.get(&inst.offset));
+        }
+        live = !matches!(flow, Flow::Jump(_) | Flow::Stop);
+        if let Some((dst, n, first)) = step(&inst, &mut tag) {
+            for k in 0..n {
+                let src = (first + u32::from(k)) as u8;
+                copies.push((out.len(), src));
+                out.push(s_mov(dst + k, src, inst.offset)?);
+            }
+            continue;
         }
         out.push(inst);
     }
@@ -1335,6 +1394,40 @@ mod tests {
             insts.iter().filter(|i| i.name() == "s_mov_b32").count(),
             1 + 4 + 4 + 1
         );
+    }
+
+    /// A table load after a join reads the arguments when no way into the
+    /// join changes the pointer, and stays a load when one does.
+    #[test]
+    fn spill_table_loads_after_a_join_need_every_way_in() {
+        let code = |skipped: u32| -> Vec<u8> {
+            [
+                0xBE82_0300u32, // s_mov_b32 s2, s0
+                0x8703_FF01,    // s_and_b32 s3, s1, lit
+                0x0000_00FF,    //   0xff
+                0xBF06_8004,    // s_cmp_eq_u32 s4, 0
+                0xBF85_0001,    // s_cbranch_scc1 (over the next word)
+                skipped,
+                0xF408_0201, // s_load_dwordx4 s[8:11], s[2:3], 0x10
+                0xFA00_0010,
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect()
+        };
+        let loads = |code: &[u8]| {
+            let p = build_with(code, false, 256, true).unwrap();
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| i.name().starts_with("s_load"))
+                .count()
+        };
+        // s_mov_b32 s5, s4: the pointer is the same both ways.
+        assert_eq!(loads(&code(0xBE85_0304)), 0);
+        // s_mov_b32 s2, s4: one way in points elsewhere.
+        assert_eq!(loads(&code(0xBE82_0304)), 1);
     }
 
     /// A later table load still reads the arguments as they were on entry,

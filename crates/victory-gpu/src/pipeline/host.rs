@@ -253,6 +253,9 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
+    /// The user data is a root CBV (in upload memory) rather than root
+    /// constants: the root signature would pass 64 dwords otherwise.
+    pub(crate) user_data_cbv: bool,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
@@ -428,18 +431,51 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
+        // Past 64 root signature dwords, user data goes in root CBVs.
+        let user_cbv = {
+            let mut views: Vec<(u8, u8)> = Vec::new();
+            let mut dwords = Vec::new();
+            let mut strides = 0;
+            for &(shader, _) in &stages {
+                let t = &shader.translated()?.host;
+                for (kind, slots) in [(0, &t.root_cbvs), (1, &t.root_srvs), (2, &t.root_uavs)] {
+                    views.extend(slots.iter().map(|&s| (kind, s)));
+                }
+                if t.user_data_dwords() > 0 {
+                    dwords.push(t.user_data_dwords());
+                }
+                strides += usize::from(t.stride_table);
+            }
+            views.sort_unstable();
+            views.dedup();
+            victory_shader::emit::user_data_in_cbv(dwords, views.len() + strides)
+        };
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
+                user_data_cbv: user_cbv,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: None,
                 root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
-            if dwords > 0 {
+            if dwords > 0 && user_cbv {
+                stage.user_data = Some((params.len() as u32, dwords));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: USER_DATA_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            } else if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
                 params.push(D3D12_ROOT_PARAMETER1 {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,

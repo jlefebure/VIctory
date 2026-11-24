@@ -207,20 +207,6 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
-            .iter()
-            .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                    Constants: D3D12_ROOT_CONSTANTS {
-                        ShaderRegister: 0,
-                        RegisterSpace: super::USER_DATA_SPACE,
-                        Num32BitValues: s.user_data_dwords().max(1),
-                    },
-                },
-                ShaderVisibility: vis,
-            })
-            .collect();
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
@@ -232,6 +218,39 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
+        let stride = usize::from(stages.iter().any(|(s, _)| s.stride_table));
+        let cbv = super::user_data_in_cbv(
+            stages.iter().map(|(s, _)| s.user_data_dwords().max(1)),
+            views.len() + stride,
+        );
+        let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
+            .iter()
+            .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
+                ParameterType: if cbv {
+                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                } else {
+                    D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
+                },
+                Anonymous: if cbv {
+                    D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: super::USER_DATA_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    }
+                } else {
+                    D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: super::USER_DATA_SPACE,
+                            Num32BitValues: s.user_data_dwords().max(1),
+                        },
+                    }
+                },
+                ShaderVisibility: vis,
+            })
+            .collect();
         for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {

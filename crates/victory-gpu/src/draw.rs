@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::{CONST_VIEW, UserData};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -529,8 +530,8 @@ impl State {
     /// no bounds on the host, and an access past the memory it maps is a
     /// GPU page fault, which some hosts stall on until the driver resets
     /// the device. 0 for a root view the title did not set.
-    fn root_view_bytes(&self, compute: bool, slot: u8, kind: RootView) -> u32 {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+    fn root_view_bytes(&self, compute: bool, user_data: &[UserData], slot: u8, kind: RootView) -> u32 {
+        let Some(address) = self.root_address(compute, user_data, slot) else {
             return 0;
         };
         // As `root_view` finds it: UAVs only in registered title buffers.
@@ -542,6 +543,27 @@ impl State {
             return 0;
         };
         u32::try_from(root_view_len(&shadow, address, kind)).unwrap_or(u32::MAX)
+    }
+
+    /// The address root view `slot` of a shader reading `user_data` binds:
+    /// a title root view's, or for [`CONST_VIEW`] and up the address in the
+    /// two dwords of root constants at user-data index `slot - CONST_VIEW`.
+    /// `None` for a root view the title did not set.
+    fn root_address(&self, compute: bool, user_data: &[UserData], slot: u8) -> Option<u64> {
+        if slot < CONST_VIEW {
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => Some(address),
+                _ => None,
+            };
+        }
+        let low = u32::from(slot - CONST_VIEW);
+        let dword = |index: u32| {
+            let u = user_data
+                .iter()
+                .find(|u| u.index == index && u.root == RootType::Constants)?;
+            Some(self.user_value(compute, u.slot, RootType::Constants, u.dword))
+        };
+        Some(u64::from(dword(low)?) | u64::from(dword(low + 1)?) << 32)
     }
 
     /// The bound heap holding `handle`.
@@ -702,17 +724,34 @@ impl State {
                             } else {
                                 RootView::Cbv
                             };
-                            self.root_view_bytes(compute, u.slot, kind)
+                            self.root_view_bytes(compute, &t.host.user_data, u.slot, kind)
                         }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if stage.user_data_cbv {
+                    let Some((gpu, to)) = list.scratch(u64::from(dwords) * 4) else {
+                        once!("no upload memory for user data; draw or dispatch dropped");
+                        return false;
+                    };
+                    // SAFETY: `to` is mapped upload memory of at least
+                    // `dwords` dwords; an open list.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(values.as_ptr(), to.cast::<u32>(), values.len());
+                        if compute {
+                            l.SetComputeRootConstantBufferView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootConstantBufferView(param, gpu);
+                        }
+                    }
+                } else {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -729,7 +768,8 @@ impl State {
                         bound_params |= 1u64 << param;
                     }
                     let uav = kind == RootView::Uav;
-                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                    let address = self.root_address(compute, &t.host.user_data, slot);
+                    let gpu = match address.map(Root::View).as_ref() {
                         Some(&Root::View(address)) if address != 0 => {
                             match root_view(list, address, kind) {
                                 Some(gpu) => gpu,
@@ -947,9 +987,9 @@ impl State {
                 .chain(&stage.root_srvs)
                 .chain(&stage.root_uavs)
             {
-                if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
-                        .map(|s| (s.gpu(*address), s.left(*address)));
+                if let Some(address) = self.root_address(compute, &t.host.user_data, slot) {
+                    let host = crate::shadow::find(address, 1)
+                        .map(|s| (s.gpu(address), s.left(address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
             }

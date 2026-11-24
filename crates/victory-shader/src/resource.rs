@@ -31,6 +31,9 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// For root constants, the dword of the parameter that holds the
+    /// address's low half (the next one holds its high half); else 0.
+    pub word: u32,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -482,6 +485,9 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        if let Some(x) = self.first_lane_of(v) {
+            return self.sum(x);
+        }
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -511,7 +517,19 @@ impl<'a> Tracer<'a> {
         else {
             return dynamic;
         };
-        let (x, y) = (self.sum(a), self.sum(b));
+        let (mut x, mut y) = (self.sum(a), self.sum(b));
+        // Two computed terms, one a root-constants dword alone: that dword
+        // is the base (an address in root constants, as `address` checks
+        // against its high half).
+        if x.base.is_none() && y.base.is_none() && x.dynamic.is_some() && y.dynamic.is_some() {
+            let alone = |s: &Sum| s.offset == 0 && s.dynamic.is_some_and(|v| self.constants_input(v));
+            for s in [&mut x, &mut y] {
+                if alone(s) {
+                    s.base = s.dynamic.take();
+                    break;
+                }
+            }
+        }
         if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
             return dynamic;
         }
@@ -631,6 +649,16 @@ impl<'a> Tracer<'a> {
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
+        // A root-constants dword other than the first is no base to `sum`
+        // (an offset, usually); as the whole low half it is an address.
+        let s = match (s.base, s.dynamic) {
+            (None, Some(v)) if self.constants_input(v) => Sum {
+                base: Some(v),
+                offset: s.offset,
+                dynamic: None,
+            },
+            _ => s,
+        };
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -644,10 +672,11 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                word: 0,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
+        let (param, word) = self
             .param_of(reg)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
@@ -656,6 +685,13 @@ impl<'a> Tracer<'a> {
                 let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
+            }
+            // A 64-bit address passed in two dwords of root constants: the
+            // host binds the buffer it points to as a root view.
+            RootType::Constants if word + 1 < self.layout[param].sgprs => {
+                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + word as u8 + 1);
+                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                Some(input.ok_or("an address in root constants without its high half")?.1)
             }
             _ => return Err("an address from a root parameter that is no address"),
         };
@@ -671,6 +707,7 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            word,
         })
     }
 
@@ -687,6 +724,9 @@ impl<'a> Tracer<'a> {
     /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
         let Term::Value(v) = hi else { return false };
+        if let Some(x) = self.first_lane_of(v) {
+            return self.carried(x, high);
+        }
         if v == high {
             return true;
         }
@@ -703,6 +743,27 @@ impl<'a> Tracer<'a> {
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+    }
+
+    /// For `v_readfirstlane_b32` writing `v`, the origin of the VGPR it
+    /// reads: an address the program computes per lane and makes scalar
+    /// (the same in every lane, as an address in SGPRs is).
+    fn first_lane_of(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.name() != "v_readfirstlane_b32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        self.vterm(inst, f.src.first()?)
+    }
+
+    /// `v` is a user SGPR of root constants.
+    fn constants_input(&self, v: Value) -> bool {
+        self.inputs[v.0 as usize]
+            .and_then(|r| self.param_of(r))
+            .is_some_and(|(param, _)| self.layout[param].root == RootType::Constants)
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
@@ -1761,7 +1822,33 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            word: 0,
         }
+    }
+
+    /// A 64-bit address in two dwords of root constants (dwords 2 and 3 of
+    /// `s[4:7]`) is that parameter's, with the dword of its low half.
+    #[test]
+    fn an_address_in_root_constants_is_their_word() {
+        let r = track_words(
+            &[
+                0xF400_0003,
+                0xFA00_0008, // s_load_dword s0, s[6:7], 0x8
+                S_ENDPGM,
+            ],
+            &[param(Constants, 4, 4)],
+            HwStage::Ps,
+        );
+        assert_eq!(
+            r.scalar,
+            [(
+                (0, 0),
+                Address {
+                    word: 2,
+                    ..at(0, 8)
+                }
+            )]
+        );
     }
 
     #[test]
