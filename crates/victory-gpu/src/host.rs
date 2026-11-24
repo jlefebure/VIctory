@@ -707,9 +707,19 @@ impl Host {
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        // By buffer, every range at once: overlapping ones compared once.
+        let mut done: Vec<*const crate::shadow::Shadow> = Vec::new();
+        for (shadow, ..) in &back {
+            if done.contains(&std::sync::Arc::as_ptr(shadow)) {
+                continue;
+            }
+            done.push(std::sync::Arc::as_ptr(shadow));
+            let ranges: Vec<(usize, usize)> = back
+                .iter()
+                .filter(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+                .map(|&(_, a, l)| (a, l))
+                .collect();
+            let written = shadow.copy_back_all(&ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
@@ -1564,22 +1574,50 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    // Something is unmapped: by 64 KiB piece, zeros for what cannot be
+    // read. A piece that fails asks the kernel how far the memory that is
+    // not committed goes and skips all of it at once: the world's sparse
+    // pools left ~500 MB per frame unmapped, and reading them 4 KiB at a
+    // time cost ~125,000 failed reads (~0.5 s) per frame.
+    let (start, end) = (src as usize, src as usize + len);
+    let zero = |at: usize, n: usize| {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+        // SAFETY: inside the destination, which is mapped.
+        unsafe { dst.wrapping_add(at - start).write_bytes(0, n) };
+    };
+    let mut at = start;
+    while at < end {
+        let next = ((at / (64 << 10) + 1) * (64 << 10)).min(end);
+        if read(at as *const u8, dst.wrapping_add(at - start), next - at) {
+            at = next;
+            continue;
         }
-    });
+        if let Some(region_end) = uncommitted_until(at) {
+            let until = region_end.min(end);
+            zero(at, until - at);
+            at = until;
+            continue;
+        }
+        // Committed but not all readable: 4 KiB at a time.
+        for_pieces(at, next - at, 4 << 10, |a, n| {
+            if !read(a as *const u8, dst.wrapping_add(a - start), n) {
+                zero(a, n);
+            }
+        });
+        at = next;
+    }
+}
+
+/// The end of the memory region at `at` when it is not committed (free or
+/// only reserved), else `None`.
+fn uncommitted_until(at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data the query fills in.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    (n != 0 && info.State != MEM_COMMIT).then(|| info.BaseAddress as usize + info.RegionSize)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

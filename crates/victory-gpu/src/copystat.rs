@@ -37,8 +37,18 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Microseconds: deciding which pages of a range to copy; snapshots of
+    /// ranges shaders write; comparing them after the run.
+    StaleUs,
+    SnapshotUs,
+    CompareUs,
+    /// Inside choosing pages: waiting for the page table's lock; copying;
+    /// pages walked.
+    StaleLockUs,
+    StaleCopyUs,
+    StalePages,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = 28;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -126,6 +136,15 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    tracing::info!(
+        "copy steps per frame: choosing pages {:.1} ms (lock {:.1} ms, copies {:.1} ms, {:.0} pages), snapshots {:.1} ms, comparing {:.1} ms",
+        ms(c[C::StaleUs as usize]),
+        ms(c[C::StaleLockUs as usize]),
+        ms(c[C::StaleCopyUs as usize]),
+        c[C::StalePages as usize],
+        ms(c[C::SnapshotUs as usize]),
+        ms(c[C::CompareUs as usize]),
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

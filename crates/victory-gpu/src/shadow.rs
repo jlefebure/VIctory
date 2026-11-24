@@ -156,6 +156,14 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        let t = std::time::Instant::now();
+        self.writing_untimed(address, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SnapshotUs, t.elapsed().as_micros() as u64);
+    }
+
+    fn writing_untimed(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -195,12 +203,43 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+    /// the copy-back of every range `(address, len)` a submission
+    /// declared: overlapping ones (the world declares nested views of one
+    /// big heap dozens of times) are compared once, as their union.
+    pub(crate) fn copy_back_all(&self, ranges: &[(usize, usize)]) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let t = std::time::Instant::now();
+        let mut spans: Vec<(usize, usize)> = ranges.iter().map(|&(a, l)| (a, a + l)).collect();
+        spans.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (a, e) in spans {
+            match merged.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((a, e)),
+            }
+        }
+        let mut written = 0;
+        {
+            let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            for (a, e) in merged {
+                written += self.compare_back(&snapshot, a, e - a);
+            }
+        }
+        for &(address, len) in ranges {
+            self.release(address, len);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CompareUs, t.elapsed().as_micros() as u64);
+        written
+    }
+
+    /// The comparing part of the copy-back, under the snapshot's
+    /// lock.
+    fn compare_back(&self, snapshot: &Option<(usize, Vec<u8>)>, address: usize, len: usize) -> usize {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some((taken, before)) = snapshot
             && *taken <= from
             && to <= taken + before.len()
             && from < to
@@ -255,8 +294,13 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        written
+    }
+
+    /// Every submitted step that declared the range is done with it (one
+    /// submission runs at a time), and the snapshot with the last range.
+    fn release(&self, address: usize, len: usize) {
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
@@ -264,7 +308,6 @@ impl Shadow {
         {
             give_back(bytes);
         }
-        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -310,7 +353,11 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                let t = std::time::Instant::now();
                 let copied = self.copy_stale(from, to, now, &written);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::StaleUs, t.elapsed().as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -330,7 +377,15 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
+        #[cfg(feature = "diagnostics")]
+        let t = std::time::Instant::now();
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::StaleLockUs, t.elapsed().as_micros() as u64);
+            add(C::StalePages, ((to - 1) / PAGE + 1 - from / PAGE) as u64);
+        }
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
@@ -368,7 +423,11 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        let t = std::time::Instant::now();
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::StaleCopyUs, t.elapsed().as_micros() as u64);
         to - from
     }
 }
