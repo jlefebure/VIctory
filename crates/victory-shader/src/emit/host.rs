@@ -1024,6 +1024,8 @@ pub enum View<'a> {
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A structured buffer UAV (element count, stride in bytes).
+    StructuredUav(u32, u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1272,7 +1274,10 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) | View::BufferUav(..) => {
+                    View::RawUav(_)
+                    | View::HalfUav(_)
+                    | View::BufferUav(..)
+                    | View::StructuredUav(_, _) => {
                         // (dwords, format, elements, element bytes, flags)
                         let (n, format, elements, stride, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1298,6 +1303,13 @@ impl Host {
                             View::BufferUav(n, Stride::Format(f, bytes)) => {
                                 (n, f, n * 4 / bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE)
                             }
+                            View::StructuredUav(e, stride) => (
+                                e * stride / 4,
+                                DXGI_FORMAT_UNKNOWN,
+                                e,
+                                stride,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
