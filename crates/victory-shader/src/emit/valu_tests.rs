@@ -149,6 +149,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         console_waves: false,
+        stride_table: lowered.stride_table,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1025,6 +1026,7 @@ fn root_view_reads_stop_at_the_bound_size() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         console_waves: false,
+        stride_table: lowered.stride_table,
     };
     assert_eq!(shader.root_srvs, [2]);
     assert!(
