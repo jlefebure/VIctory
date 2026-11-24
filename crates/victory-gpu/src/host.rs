@@ -1903,20 +1903,44 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         .iter()
         .position(barrier)
         .map_or(history.len(), |b| (done + b).max(done + 1));
-    let mut text = format!(", commands {from}..{to} between its barriers:");
-    let mut shown = 0;
-    for i in from..to {
-        let op = history[i];
-        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || shown == 12 {
-            continue;
-        }
-        shown += 1;
-        let marker = i
-            .checked_sub(1)
+    let marker = |i: usize| {
+        i.checked_sub(1)
             .filter(|&m| history[m] == D3D12_AUTO_BREADCRUMB_OP_SETMARKER)
             .and_then(|m| markers.iter().find(|(at, _)| *at as usize == m))
-            .map_or("no marker", |(_, s)| s.as_str());
-        text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
+            .map_or("no marker", |(_, s)| s.as_str())
+    };
+    // The pipeline part of a marker ("[mesh .., pixel ..]"), which repeats.
+    let key = |m: &str| -> String {
+        m.find('[')
+            .and_then(|a| m[a..].find(']').map(|b| m[a..=a + b].to_owned()))
+            .unwrap_or_else(|| m.split(" | ").next().unwrap_or(m).to_owned())
+    };
+    let mut text = format!(", commands {from}..{to} between its barriers:");
+    if let Some(&op) = history.get(done) {
+        text.push_str(&format!(
+            "; stopped at {done} (op {}): {}",
+            op.0,
+            marker(done)
+        ));
+    }
+    // Every other pipeline of the span once, with how many commands use it.
+    let mut kinds: Vec<(String, usize, usize, i32)> = Vec::new();
+    for (i, &op) in history.iter().enumerate().take(to).skip(from) {
+        if op == D3D12_AUTO_BREADCRUMB_OP_SETMARKER || i == done {
+            continue;
+        }
+        let k = key(marker(i));
+        match kinds.iter_mut().find(|e| e.0 == k) {
+            Some(e) => e.1 += 1,
+            None => kinds.push((k, 1, i, op.0)),
+        }
+    }
+    const SHOWN: usize = 32;
+    for (k, n, first, op) in kinds.iter().take(SHOWN) {
+        text.push_str(&format!("; {n}x from {first} (op {op}): {k}"));
+    }
+    if kinds.len() > SHOWN {
+        text.push_str(&format!("; {} more pipelines", kinds.len() - SHOWN));
     }
     text
 }
