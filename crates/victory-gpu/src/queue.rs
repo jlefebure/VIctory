@@ -124,6 +124,10 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&host_lists);
+        // Waited for: their dynamic descriptor slots are free again.
+        for &l in lists {
+            crate::list::ran(l);
+        }
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

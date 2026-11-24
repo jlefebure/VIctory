@@ -75,17 +75,54 @@ pub(crate) struct State {
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
+    /// back once its submission has run, or when it is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The list ran and its dynamic slots were given back: running it
+    /// again before a reset would read slots others may have taken.
+    ran: bool,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+/// Lists' states holding dynamic slots (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static HOLDERS: AtomicU64 = AtomicU64::new(0);
+
+impl State {
+    /// After the list's submission has run on the host GPU (submissions
+    /// are waited for): its dynamic slots go back to the heap. The title
+    /// keeps a hundred or so recorded lists before it resets them; holding
+    /// their slots until then used up a capped heap's dynamic range
+    /// (NVIDIA: 65,536 slots) within seconds of entering the world, and
+    /// every draw needing a fresh table was dropped after that.
+    pub(crate) fn ran(&mut self) {
+        if self.ran && self.dynamic.is_empty() {
+            // Run again without a reset: its fresh tables' slots may hold
+            // other tables now.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("a list run again after its dynamic slots were given back");
+            });
+        }
+        self.ran = true;
+        self.give_back_dynamic();
+    }
+
+    fn give_back_dynamic(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if !self.dynamic.is_empty() {
+            HOLDERS.fetch_sub(1, Ordering::Relaxed);
+        }
+        for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.fresh_tables.clear();
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        self.give_back_dynamic();
     }
 }
 
@@ -758,6 +795,10 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
+            #[cfg(feature = "diagnostics")]
+            if self.dynamic.is_empty() {
+                HOLDERS.fetch_add(1, Ordering::Relaxed);
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
