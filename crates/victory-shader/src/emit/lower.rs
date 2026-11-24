@@ -173,7 +173,9 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u64), V>,
+    /// The instruction that writes each value.
+    defs: HashMap<Value, Site>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -479,6 +481,16 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            defs: p
+                .blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(b, bl)| {
+                    bl.insts.iter().enumerate().flat_map(move |(i, inst)| {
+                        inst.writes.iter().map(move |w| (w.1, (b, i)))
+                    })
+                })
+                .collect(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1831,6 +1843,50 @@ impl<'a> Lower<'a> {
 
     /// Starts code only the lanes where `guard` holds run (a store under a
     /// lane guard): returns where it started and the join block.
+    /// Whether `words` (an image store's data) are dwords an integer
+    /// computation made: each written by an integer instruction (bit
+    /// operations, shifts, integer arithmetic or conversion to an integer),
+    /// through copies, or a constant; at least one by such an instruction,
+    /// none by anything else.
+    fn integer_words(&self, words: &[Value]) -> bool {
+        const INTEGER: [&str; 20] = [
+            "v_or_b32", "v_or3_b32", "v_and_b32", "v_xor_b32", "v_xor3_b32", "v_not_b32",
+            "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_lshl_or_b32",
+            "v_and_or_b32", "v_lshl_add_u32", "v_add_lshl_u32", "v_bfi_b32", "v_bfe_u32",
+            "v_alignbit_b32", "v_perm_b32", "v_cvt_u32_f32", "v_cvt_pk_u16_u32", "v_add_nc_u32",
+        ];
+        let mut any = false;
+        for &w in words {
+            let mut v = w;
+            for _ in 0..8 {
+                let Some(&(b, i)) = self.defs.get(&v) else {
+                    return false;
+                };
+                let inst = &self.x.p.blocks[b].insts[i];
+                let name = inst.name();
+                if INTEGER.contains(&name) {
+                    any = true;
+                    break;
+                }
+                let Fields::Valu(f) = &inst.fields else {
+                    return false;
+                };
+                if name != "v_mov_b32" || f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                    return false;
+                }
+                match f.src.first() {
+                    Some(Operand::Vector { reg, .. }) => match inst.read(Reg::V(*reg)) {
+                        Some(x) => v = x,
+                        None => return false,
+                    },
+                    Some(Operand::Const(_) | Operand::Literal(_)) => break,
+                    _ => return false,
+                }
+            }
+        }
+        any
+    }
+
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
@@ -3308,7 +3364,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, u64::from(props.0) | u64::from(props.1) << 32);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5743,6 +5799,28 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
+            // Data an integer computation made (bits the program packs, as
+            // into RGB9E5): the console stores the dwords as they are and the
+            // view's format, an integer one then, decides what they mean. A
+            // float store would have the host convert them to an integer (a
+            // tiny float: 0). Stored as integers to an integer view.
+            let words: Option<Vec<Value>> = (0..4u8).map(|k| inst.read(Reg::V(reg + k))).collect();
+            if !*d16 && let Some(words) = words.filter(|w| self.integer_words(w)) {
+                let mut vals = Vec::new();
+                for &w in &words {
+                    vals.push(self.i32_of(w)?);
+                }
+                let h = self.handle(site, src, false, (props.0, 0x405))?;
+                let at = self.begin_guarded(guard);
+                let mut args = vec![h];
+                args.extend(cs);
+                args.extend(vals);
+                args.push(self.s.m.i8(0xF));
+                let void = self.s.t.void;
+                self.s.op(self.cur, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut vals = Vec::new();
             for k in 0..4u8 {
                 // d16: two f16 channels per VGPR, low half first.
