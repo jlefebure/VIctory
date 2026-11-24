@@ -1548,9 +1548,12 @@ impl State {
                     crate::pipeline::note_drop(self.pipeline as This);
                     self.note_dropped_writes();
                 }
+                Some(_) if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES => {
+                    why("rectangles (not expanded for indirect draws)")
+                }
                 Some(p) => why(&format!(
-                    "prepare failed (compute {}, mesh {})",
-                    p.compute, p.mesh
+                    "prepare failed (compute {}, mesh {}) {}",
+                    p.compute, p.mesh, p.name
                 )),
             }
             return false;
