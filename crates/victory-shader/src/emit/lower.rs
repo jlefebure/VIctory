@@ -220,6 +220,10 @@ struct Lower<'a> {
     console_cf: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
+    /// A console wave64 group of one wave sharing LDS without barriers, run
+    /// as two 32-lane host waves: a group barrier before and after each LDS
+    /// write keeps the halves in the console's order (see `Lower::new`).
+    lds_sync: bool,
     /// The console thread's flat id in the group (relabelled; see
     /// [`Self::thread_id`]).
     console_flat: Option<V>,
@@ -398,6 +402,7 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut split = false;
         let mut wants_console_flow = false;
+        let mut lds_sync = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -479,8 +484,38 @@ impl<'a> Lower<'a> {
                 console_lanes = true;
                 split = true;
             }
+            // One console wave sharing LDS, with no lane reading another
+            // lane: the console compiler leaves out barriers, since the
+            // wave's lanes run together. As two host waves, a group barrier
+            // around each LDS write orders the halves as the console does
+            // (a write after the reads before it, a read after the writes
+            // before it). Barriers must be reached by the whole group, so
+            // only when every LDS write is: under conditions on uniform
+            // values only (scalar branches), which every lane takes alike.
+            let uniform = |b: Bool| {
+                x.st.bools
+                    .support(b)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_)))
+            };
+            lds_sync = !console_lanes
+                && !split
+                && x.native.wave64
+                && one_wave
+                && s.lds_dwords > 0
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && p.blocks.iter().enumerate().all(|(b, block)| {
+                    block.insts.iter().enumerate().all(|(i, inst)| {
+                        !lds_write(inst)
+                            || uniform(x.st.reach[b]) && x.st.guards[b][i].is_none_or(uniform)
+                    })
+                });
             if split {
                 s.wave_size = Some(32);
+            } else if lds_sync {
+                // Any host wave size: the barriers do what the console's
+                // single wave did.
             } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -581,6 +616,7 @@ impl<'a> Lower<'a> {
             split,
             console_cf: x.console_cf,
             wants_console_flow,
+            lds_sync,
             console_flat: None,
             xchg: None,
             flat: None,
@@ -2622,6 +2658,12 @@ impl<'a> Lower<'a> {
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
+            Fields::Ds { .. } if self.lds_sync && lds_write(inst) => {
+                self.lds_barrier();
+                let r = self.ds(inst, b, i);
+                self.lds_barrier();
+                r
+            }
             Fields::Ds { .. } => self.ds(inst, b, i),
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
@@ -7509,6 +7551,14 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// A group barrier with a group-shared memory fence ([`Self::lds_sync`]).
+    fn lds_barrier(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
@@ -7572,6 +7622,16 @@ impl<'a> Lower<'a> {
         }
         Ok(())
     }
+}
+
+/// An LDS access that writes (stores and atomics; not reads, swizzles or
+/// permutes, which only read).
+fn lds_write(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Ds { .. })
+        && !(name.starts_with("ds_read")
+            || name.starts_with("ds_swizzle")
+            || name.contains("permute"))
 }
 
 #[cfg(test)]
@@ -7668,6 +7728,59 @@ mod tests {
             target: super::super::Target::ANY,
             console_cf: false,
         })
+    }
+
+    #[test]
+    fn one_wave64_sharing_lds_runs_on_32_lane_hosts_with_barriers() {
+        // A group of one console wave64 sharing LDS: no barrier on the
+        // console. On 32-lane hosts it ran nowhere; now each write is
+        // fenced by group barriers instead.
+        let words = [
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xD8D8_0000,
+            0x0100_0000, // ds_read_b32 v1, v0
+            S_ENDPGM,
+        ];
+        let lowered = |target: super::super::Target| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 15 | 2 << 1, // 512 bytes of LDS
+                    threads: [64, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, true, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                target,
+                console_cf: false,
+            })
+        };
+        let nvidia = super::super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        lowered(nvidia).expect("one wave64 sharing LDS on a 32-lane host");
+        lowered(super::super::Target::ANY).expect("unchanged where 64-lane waves run");
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
