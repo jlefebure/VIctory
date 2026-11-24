@@ -133,6 +133,18 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// After a title list's submission has run on the host GPU: see
+/// [`crate::draw::State::ran`].
+#[cfg(windows)]
+pub(crate) fn ran(this: This) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).ran();
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
