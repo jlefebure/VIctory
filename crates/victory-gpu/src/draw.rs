@@ -248,6 +248,46 @@ impl State {
         }
     }
 
+    fn apply_heaps(&mut self, list: &HostList) {
+        if self.host_heaps == self.heaps {
+            return;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and live shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = self.heaps;
+        self.host_roots = [0; 2];
+    }
+
+    /// Ensures a shader-visible view heap is bound on `list` before commands
+    /// needing a GPU handle outside draw/dispatch (`ClearUnorderedAccessView*`).
+    pub(crate) fn ensure_view_heap(&mut self, list: &HostList, fallback: u64) -> Option<usize> {
+        if self.heaps[0] != 0 {
+            self.apply_heaps(list);
+            return Some(self.heaps[0]);
+        }
+        let heap_ptr = crate::descriptor::view_heap_for(fallback)?;
+        let host = crate::descriptor::heap(heap_ptr as This).host()?;
+        list.keep(&host.heap);
+        // SAFETY: an open list and live shader-visible view heap.
+        unsafe { list.list.SetDescriptorHeaps(&[Some(host.heap.clone())]) };
+        self.host_heaps = [heap_ptr, 0];
+        self.host_roots = [0; 2];
+        Some(heap_ptr)
+    }
+
+    /// Records dynamic descriptor slots so they are returned on list reset or drop.
+    pub(crate) fn hold_dynamic(&mut self, heap: usize, first: u32, n: u32) {
+        self.dynamic.push((heap, first, n));
+    }
+
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
         if compute {
             &mut self.compute
@@ -477,20 +517,7 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        self.apply_heaps(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
