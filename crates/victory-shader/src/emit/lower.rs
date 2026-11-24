@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Mesh primitive exports bounded by the declared vertex count.
+    #[cfg(test)]
+    pub bounded_prims: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -910,6 +913,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            bounded_prims: self.s.bounded_prims,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6692,19 +6697,39 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// indices 0: no area), and so does an index at or past the declared
+    /// vertex count: the console's 10-bit fields reach 1023, and an index
+    /// outside the mesh outputs is undefined on the host (an NVIDIA driver
+    /// was seen to hang on such a draw).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let max_vertices = self
+            .s
+            .mesh
+            .ok_or("a primitive export outside a mesh shader")?
+            .max_vertices;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let limit = self.s.m.i32(max_vertices);
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let outside = self.s.m.cmp(c, pred::IUGE, i, limit);
+            let yes = self.s.m.bool(true);
+            culled = self.s.m.select(c, outside, yes, culled);
+            indices.push(i);
+        }
+        #[cfg(test)]
+        {
+            self.s.bounded_prims += 1;
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
@@ -7035,6 +7060,53 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    #[test]
+    fn mesh_primitive_indices_are_bounded_by_the_vertex_count() {
+        // The console packs three 10-bit indices; one past the declared
+        // vertex count must not reach EmitIndices.
+        let words = [
+            0x7E04_0505u32, // v_readfirstlane_b32 s2, v5 (the group input)
+            0xF800_0941,
+            0x0000_0009, // exp prim, v9, off, off, off done
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 64,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(l.bounded_prims, 1);
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

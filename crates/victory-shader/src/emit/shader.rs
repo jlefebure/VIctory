@@ -68,6 +68,10 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Mesh primitive exports whose indices are checked against the
+    /// declared vertex count.
+    #[cfg(test)]
+    pub bounded_prims: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -122,6 +126,8 @@ impl Shader {
             root_srvs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            #[cfg(test)]
+            bounded_prims: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
