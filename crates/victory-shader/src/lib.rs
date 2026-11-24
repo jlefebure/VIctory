@@ -15,6 +15,7 @@ pub mod ir;
 pub mod native;
 pub mod resource;
 pub mod structure;
+pub mod uniform;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

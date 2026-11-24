@@ -308,20 +308,24 @@ fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
 ///   wave64 compute translations (declaring `WaveSize(32)` or unconstrained)
 ///   run on 32-lane hosts while still refusing modules that require 64 lanes
 ///   (and refusing 32/64-lane modules on 4-lane WARP).
-/// - Console `wave64` mesh programs do not carry `PSV0` `WaveSize(64)`
-///   metadata, so they are refused whenever `host_lanes.1 < 64`.
+/// - Mesh programs carry no `PSV0` wave size (SM 6.6 has none for them).
+///   Their lanes are computed from the thread id, so a console wave64 mesh
+///   program runs as two 32-lane waves, except one whose translation needs
+///   the console's waves (`console_waves`: a first-lane read of a value that
+///   may differ between lanes). Only those are refused when
+///   `host_lanes.1 < 64`.
 /// - Vertex and pixel programs run per lane and are kept unless their emitted
 ///   DXIL explicitly requires an unsupported wave size.
 fn wave_lanes_unsupported(
     stage: &str,
-    console_wave64: bool,
+    console_waves: bool,
     emitted_wave: Option<(u32, u32)>,
     (host_min, host_max): (u32, u32),
 ) -> bool {
     if let Some((req_min, req_max)) = emitted_wave {
         return host_max < req_min || host_min > req_max;
     }
-    stage == "mesh" && console_wave64 && host_max < 64
+    stage == "mesh" && console_waves && host_max < 64
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -372,13 +376,18 @@ impl HostPipeline {
         }
         let host_lanes = host()?.wave_lanes();
         if let Some(ms) = mesh
-            && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
+            && wave_lanes_unsupported(
+                ms.stage,
+                ms.translated()?.host.console_waves,
+                None,
+                host_lanes,
+            )
         {
             return refuse(
                 if host_lanes.1 < 32 {
-                    "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
+                    "a mesh program reading lanes of a 64-lane wave, on a host without them (e.g. 4-lane WARP)"
                 } else {
-                    "a mesh program written for 64-lane waves, on a host without them"
+                    "a mesh program reading lanes of a 64-lane wave, on a host without them"
                 },
                 shaders,
             );
@@ -386,7 +395,7 @@ impl HostPipeline {
         for (s, _) in &stages {
             let t = s.translated()?;
             let emitted = dxil_wave_lanes(&t.host.dxil);
-            if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
+            if wave_lanes_unsupported(s.stage, t.host.console_waves, emitted, host_lanes) {
                 return refuse(
                     if host_lanes.1 < 32 {
                         "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
@@ -805,7 +814,8 @@ mod tests {
         assert!(!wave_lanes_unsupported("compute", true, None, (32, 32)));
         assert!(!wave_lanes_unsupported("compute", true, None, (4, 4)));
 
-        // Console wave64 mesh has no PSV0 WaveSize metadata and still needs 64-lane hosts.
+        // Mesh has no PSV0 WaveSize: refused only when its translation needs the
+        // console's 64-lane waves (a first-lane read of a lane-varying value).
         assert!(wave_lanes_unsupported("mesh", true, None, (32, 32)));
         assert!(wave_lanes_unsupported("mesh", true, None, (4, 4)));
         assert!(!wave_lanes_unsupported("mesh", true, None, (32, 64)));

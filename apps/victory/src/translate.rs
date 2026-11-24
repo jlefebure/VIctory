@@ -69,6 +69,8 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Mesh programs that need the console's 64-lane waves.
+    ms_console_waves: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +132,7 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.ms_console_waves += other.ms_console_waves;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -267,8 +270,8 @@ pub fn run(
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
     );
     println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+        "             {} emitted of {} mesh programs; {} validated, {} pipelines; {} need 64-lane waves",
+        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines, t.ms_console_waves
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -393,6 +396,7 @@ fn translate(
                     match emit::emit(&container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            t.ms_console_waves += usize::from(shader.console_waves);
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t

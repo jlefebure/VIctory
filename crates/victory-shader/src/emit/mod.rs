@@ -156,6 +156,10 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Correct only where host waves hold the console's 64 lanes: a wave64
+    /// mesh program reads a value that may differ between lanes through
+    /// `v_readfirstlane_b32` (see [`crate::uniform`]).
+    pub console_waves: bool,
 }
 
 impl HostShader {
@@ -308,6 +312,9 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        console_waves: native.wave64
+            && native.stage == HwStage::Ms
+            && crate::uniform::first_lane_reads_vary(p, st, &[ir::Reg::V(5)]),
     })
 }
 
@@ -565,6 +572,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            console_waves: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +583,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                console_waves: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
