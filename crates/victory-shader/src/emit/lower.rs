@@ -249,12 +249,14 @@ struct Lower<'a> {
     const_written: HashSet<(usize, u32)>,
     /// A compute program's dispatch fold width, once read.
     fold_width: Option<V>,
+    /// The instruction that writes each value.
+    defs: HashMap<Value, Site>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u64), V>,
     /// Runtime stride table entries read in a block, by the descriptor's
     /// load: the raw slot, the stride and the bias.
     entries: HashMap<(usize, Site, u8), [V; 3]>,
@@ -710,6 +712,16 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             root_sizes: HashMap::new(),
             fold_width: None,
+            defs: p
+                .blocks
+                .iter()
+                .enumerate()
+                .flat_map(|(b, bl)| {
+                    bl.insts.iter().enumerate().flat_map(move |(i, inst)| {
+                        inst.writes.iter().map(move |w| (w.1, (b, i)))
+                    })
+                })
+                .collect(),
             const_written: x
                 .res
                 .scalar
@@ -839,6 +851,59 @@ impl<'a> Lower<'a> {
         let index = self.s.m.select(c, over, last, index);
         let at = self.s.m.element(c, g, index);
         Ok(self.s.m.load(c, at))
+    }
+
+    /// Whether `words` (an image store's data) are dwords an integer
+    /// computation made: each written by an integer instruction (bit
+    /// operations, shifts, integer arithmetic or conversion to an integer),
+    /// through copies, or a constant; at least one by such an instruction,
+    /// none by anything else.
+    fn integer_words(&self, words: &[Value]) -> bool {
+        const INTEGER: [&str; 20] = [
+            "v_or_b32", "v_or3_b32", "v_and_b32", "v_xor_b32", "v_xor3_b32", "v_not_b32",
+            "v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32", "v_lshl_or_b32",
+            "v_and_or_b32", "v_lshl_add_u32", "v_add_lshl_u32", "v_bfi_b32", "v_bfe_u32",
+            "v_alignbit_b32", "v_perm_b32", "v_cvt_u32_f32", "v_cvt_pk_u16_u32", "v_add_nc_u32",
+        ];
+        let mut any = false;
+        for &w in words {
+            let mut v = w;
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                let Some(&(b, i)) = self.defs.get(&v) else {
+                    return false;
+                };
+                let inst = &self.x.p.blocks[b].insts[i];
+                let name = inst.name();
+                if name == "v_mov_b32"
+                    && steps < 8
+                    && let Fields::Valu(f) = &inst.fields
+                    && f.abs == 0
+                    && f.neg == 0
+                    && f.sdwa.is_none()
+                    && f.dpp.is_none()
+                {
+                    match f.src.first() {
+                        Some(Operand::Vector { reg, .. }) => {
+                            let Some(x) = inst.read(Reg::V(*reg)) else {
+                                return false;
+                            };
+                            v = x;
+                            continue;
+                        }
+                        Some(Operand::Const(_) | Operand::Literal(_)) => break,
+                        _ => return false,
+                    }
+                }
+                if INTEGER.contains(&name) {
+                    any = true;
+                    break;
+                }
+                return false;
+            }
+        }
+        any
     }
 
     /// A 32-bit `global_atomic_<op>` on the root UAV at the address the title
@@ -4561,7 +4626,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, u64::from(props.0) | u64::from(props.1) << 32);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -7194,6 +7259,38 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
+            // Data an integer computation made (bits packed by the program,
+            // as into RGB9E5): the console stores the dwords as they are, for
+            // an integer view; the host's view is then an integer one too,
+            // which a float store would convert. Stored as integers.
+            let words: Vec<Value> = (0..4u8)
+                .map(|k| inst.read(Reg::V(reg + k)))
+                .collect::<Option<_>>()
+                .ok_or("image store data")?;
+            if !*d16 && self.integer_words(&words) {
+                let iu = self.s.m.undef(self.s.t.i32);
+                let mut cs = vec![iu; 3];
+                for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+                    *slot = addr_val(self, k)?;
+                }
+                let mut vals = Vec::new();
+                for &w in &words {
+                    vals.push(self.i32_of(w)?);
+                }
+                if super::debug_stores() {
+                    vals = [1u32, 2, 3, 4].iter().map(|&x| self.s.m.i32(x)).collect();
+                }
+                let h = self.handle(site, src, false, (props.0, 0x405))?;
+                let at = self.begin_guarded(guard);
+                let mut args = vec![h];
+                args.extend(cs);
+                args.extend(vals);
+                args.push(self.s.m.i8(0xF));
+                let void = self.s.t.void;
+                self.s.op(self.cur, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut vals = Vec::new();
             for k in 0..4u8 {
                 // d16: two f16 channels per VGPR, low half first.
@@ -7211,6 +7308,9 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+            }
+            if super::debug_stores() {
+                vals = [1.0f32, 0.5, 0.25, 1.0].iter().map(|&x: &f32| self.s.m.f32(x.to_bits())).collect();
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

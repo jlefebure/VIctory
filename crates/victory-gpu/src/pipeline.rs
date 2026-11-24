@@ -107,6 +107,16 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // Diagnostics: `VICTORY_DEBUG_STORE=<hash>` translates that
+                // shader afresh with constant image stores.
+                #[cfg(feature = "diagnostics")]
+                let done = if std::env::var("VICTORY_DEBUG_STORE").is_ok_and(|h| h == self.hash) {
+                    tracing::warn!(hash = %self.hash, "VICTORY_DEBUG_STORE: constant image stores");
+                    victory_shader::emit::with_debug_stores(|| translate_uncached(&self.container))
+                } else {
+                    translate(&self.container)
+                };
+                #[cfg(not(feature = "diagnostics"))]
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => {
@@ -186,9 +196,21 @@ fn failed_dump_dir() -> Option<&'static std::path::Path> {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
     let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
     let host = crate::shader_cache::host_shader(container, target)?;
+    finish(container, host)
+}
+
+/// [`translate`] without the cache (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn translate_uncached(container: &[u8]) -> Result<Translated, String> {
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let host = victory_shader::emit::translate_for(container, target).map_err(|e| e.to_string())?;
+    finish(container, host)
+}
+
+fn finish(container: &[u8], host: victory_shader::emit::HostShader) -> Result<Translated, String> {
+    use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)

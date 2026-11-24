@@ -967,10 +967,61 @@ impl State {
         self.frame_op(&format!("dispatch {x}x{y}x{z}"), true, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(hx, hy, z) };
+        #[cfg(feature = "diagnostics")]
+        self.read_back_writes(list, p, format!("dispatch {x}x{y}x{z}"));
         if p.has_root_uavs() {
             emit_uav_barrier(list);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `VICTORY_READBACK_WRITES=<hash>`: after each dispatch of that compute
+    /// program in a captured frame, the small buffers (up to 256 bytes) its
+    /// tables give it to write, logged as the GPU left them (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn read_back_writes(&self, list: &HostList, p: &HostPipeline, what: String) {
+        let Ok(hash) = std::env::var("VICTORY_READBACK_WRITES") else {
+            return;
+        };
+        if !p.name.contains(&hash)
+            || !tracing::enabled!(tracing::Level::DEBUG)
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let text = self.op_text(what.clone(), true);
+        let ranges: Vec<(u64, u64)> = text
+            .split("uav buffer Some((")
+            .skip(1)
+            .filter_map(|t| {
+                let (a, rest) = t.split_once(", ")?;
+                let n = rest.split(')').next()?;
+                Some((a.parse().ok()?, n.parse().ok()?))
+            })
+            .filter(|&(_, n)| n > 0 && n <= 256)
+            .collect();
+        for (address, n) in ranges {
+            let (Some(shadow), Some((rb, at))) = (crate::shadow::find(address, n), host.readback_buffer(n)) else {
+                continue;
+            };
+            // SAFETY: an open list; title buffer copies stay in the
+            // unordered-access state between passes.
+            unsafe {
+                let l = &list.list;
+                l.ResourceBarrier(&[uav_then(&shadow.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                l.CopyBufferRegion(&rb, 0, &shadow.buffer, shadow.offset(address), n);
+                l.ResourceBarrier(&[uav_then(&shadow.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            }
+            list.keep(&rb);
+            list.defer_arg_log(
+                format!("WRITES {address:#x} ({address}) after {what} {}", p.name),
+                at,
+                n as usize,
+            );
+        }
     }
 
     /// In frames listed for capture, at debug level: one line per draw or

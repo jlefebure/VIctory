@@ -122,6 +122,24 @@ pub fn user_data_in_cbv(user_dwords: impl IntoIterator<Item = u32>, descriptors:
     constants + 2 * descriptors as u32 > 64
 }
 
+thread_local! {
+    static DEBUG_STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Diagnostics: translations `f` makes on this thread store a constant
+/// (1, 0.5, 0.25, 1) with every `image_store`, to tell a program whose
+/// writes do not land from one that computes nothing.
+pub fn with_debug_stores<R>(f: impl FnOnce() -> R) -> R {
+    DEBUG_STORES.with(|d| d.set(true));
+    let r = f();
+    DEBUG_STORES.with(|d| d.set(false));
+    r
+}
+
+pub(crate) fn debug_stores() -> bool {
+    DEBUG_STORES.with(std::cell::Cell::get)
+}
+
 /// The first root view register of an address in two dwords of root
 /// constants (see the module notes); title root parameter indices stay
 /// below it.
