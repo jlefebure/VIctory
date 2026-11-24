@@ -252,8 +252,8 @@ fn dump_on() -> bool {
 /// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
 /// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) bound
 /// most often (render-target binds and UAV uses, not draws), usually a G-buffer layer
-/// in a world frame. Only textures the swap chain copy can take (one mip level,
-/// one array slice) are shown, in either mode. A debugging
+/// in a world frame. Only textures the swap chain copy can take (single-sampled 2D,
+/// one mip level, one array slice) are shown, in either mode. A debugging
 /// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
 /// finished picture.
 #[derive(Clone, Copy)]
@@ -301,13 +301,19 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
         tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
     }
     let pick = match show {
-        Show::Index(n) => targets.get(n).filter(|(_, c)| presentable(c)).map(|(_, c)| c.clone()),
+        Show::Index(n) => targets
+            .get(n)
+            .filter(|(_, c)| {
+                // SAFETY: a live resource.
+                presentable(&unsafe { c.texture.GetDesc() })
+            })
+            .map(|(_, c)| c.clone()),
         Show::Busiest => targets
             .iter()
             .filter(|(_, c)| {
                 // SAFETY: a live resource.
                 let d = unsafe { c.texture.GetDesc() };
-                presentable(c)
+                presentable(&d)
                     && d.Width >= 1280
                     // Screen-shaped (16:9): not a shadow map, which is bound more often.
                     && d.Width * 9 == u64::from(d.Height) * 16
@@ -323,12 +329,12 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
     pick
 }
 
-/// Whether the swap chain copy can take `c` (`CopyResource` needs one mip
-/// level and one array slice, like the back buffer's).
-fn presentable(c: &crate::resource::HostTexture) -> bool {
-    // SAFETY: a live resource.
-    let d = unsafe { c.texture.GetDesc() };
-    d.MipLevels == 1 && d.DepthOrArraySize == 1
+/// Checks the resource shape required by the swap-chain copy.
+fn presentable(d: &D3D12_RESOURCE_DESC) -> bool {
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && d.SampleDesc.Count == 1
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -650,5 +656,28 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn swap_copy_requires_one_single_sampled_2d_subresource() {
+        let mut d = super::D3D12_RESOURCE_DESC {
+            Dimension: super::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            MipLevels: 1,
+            DepthOrArraySize: 1,
+            SampleDesc: super::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(super::presentable(&d));
+        d.MipLevels = 4;
+        assert!(!super::presentable(&d));
+        d.MipLevels = 1;
+        d.DepthOrArraySize = 2;
+        assert!(!super::presentable(&d));
+        d.DepthOrArraySize = 1;
+        d.SampleDesc.Count = 4;
+        assert!(!super::presentable(&d));
+        d.SampleDesc.Count = 1;
+        d.Dimension = super::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        assert!(!super::presentable(&d));
     }
 }
