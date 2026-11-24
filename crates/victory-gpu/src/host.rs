@@ -48,6 +48,10 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A ring of non-shader-visible UAVs for `ClearUnorderedAccessView*`.
+    uavs: ID3D12DescriptorHeap,
+    uav_size: u32,
+    next_uav: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -193,20 +197,9 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let (rtvs, rtv_size) = cpu_ring_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)?;
+        let (dsvs, dsv_size) = cpu_ring_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)?;
+        let (uavs, uav_size) = cpu_ring_heap(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)?;
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -219,10 +212,29 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            uavs,
+            uav_size,
+            next_uav: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+fn cpu_ring_heap(
+    device: &ID3D12Device,
+    kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+) -> windows::core::Result<(ID3D12DescriptorHeap, u32)> {
+    // SAFETY: plain non-shader-visible descriptor heap creation and stride query.
+    unsafe {
+        let heap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: RTV_RING,
+            ..Default::default()
+        })?;
+        let step = device.GetDescriptorHandleIncrementSize(kind);
+        Ok((heap, step))
     }
 }
 
@@ -821,21 +833,31 @@ impl Host {
         first_error
     }
 
+    fn ring_handle(
+        heap: &ID3D12DescriptorHeap,
+        step: u32,
+        next: &AtomicU32,
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = next.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: `heap` is live with `RTV_RING` slots.
+        let mut handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * step) as usize;
+        handle
+    }
+
     /// A host render target view of `resource`, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = Self::ring_handle(&self.rtvs, self.rtv_size, &self.next_rtv);
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
@@ -844,15 +866,18 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = Self::ring_handle(&self.dsvs, self.dsv_size, &self.next_dsv);
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
+    }
+
+    /// A non-shader-visible CPU descriptor handle for `ClearUnorderedAccessView*`.
+    pub(crate) fn uav_cpu(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        Self::ring_handle(&self.uavs, self.uav_size, &self.next_uav)
     }
 }
 
@@ -2056,6 +2081,19 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; {} more pipelines", kinds.len() - SHOWN));
     }
     text
+}
+
+pub(crate) fn uav_barrier(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
+        },
+    }
 }
 
 pub(crate) fn transition(

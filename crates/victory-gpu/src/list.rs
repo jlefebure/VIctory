@@ -877,6 +877,175 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+#[cfg(windows)]
+enum ClearUavValues {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
+#[cfg(windows)]
+fn clear_uav(
+    this: This,
+    view_gpu: u64,
+    view_cpu: u64,
+    resource: This,
+    values: ClearUavValues,
+    count: u32,
+    rects: *const Rect,
+) {
+    use crate::descriptor::host::{ClearKind, ClearUavTarget};
+    use windows::Win32::Foundation::RECT;
+
+    let Some(view) =
+        crate::descriptor::view(view_cpu).or_else(|| crate::descriptor::view(view_gpu))
+    else {
+        return;
+    };
+    let kind = match values {
+        ClearUavValues::Uint(_) => ClearKind::Uint,
+        ClearUavValues::Float(_) => ClearKind::Float,
+    };
+    with_state(this, |list, state| {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Some(heap_ptr) = state.ensure_view_heap(list, view_gpu) else {
+            return;
+        };
+        let Some(host_heap) = crate::descriptor::heap(heap_ptr as This).host() else {
+            return;
+        };
+        let Some(slot) = host_heap.dynamic(1) else {
+            return;
+        };
+        let cpu_only = host.uav_cpu();
+        let Some(target) = host_heap.prepare_clear_uav(slot, &view, resource, cpu_only, kind) else {
+            host_heap.release(slot, 1);
+            return;
+        };
+        state.hold_dynamic(heap_ptr, slot, 1);
+        let gpu_handle = host_heap.gpu_handle(slot);
+        let rects: &[RECT] = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles, laid out as `RECT`.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        let host_res = match &target {
+            ClearUavTarget::Texture {
+                resource: tex,
+                title_resource,
+            } => {
+                const UNORDERED_ACCESS: u32 = 0x8;
+                if !rects.is_empty() && crate::texture::title_written(tex) {
+                    crate::texture::upload(list, *title_resource, tex);
+                }
+                ensure_state(list, *title_resource, UNORDERED_ACCESS);
+                let raw = *title_resource as usize;
+                list.defer_host(move || crate::texture::host_written(raw as This));
+                tex.clone()
+            }
+            ClearUavTarget::Buffer {
+                shadow,
+                address,
+                len,
+            } => {
+                shadow.refresh(list, *address, (*len).max(1));
+                shadow.gpu_writes(list, *address, (*len).max(1));
+                shadow.buffer.clone()
+            }
+        };
+        list.keep(&host_res);
+        // SAFETY: open list, bound view heap, matching CPU/GPU UAVs, and live resource.
+        unsafe {
+            match values {
+                ClearUavValues::Uint(v) => list
+                    .list
+                    .ClearUnorderedAccessViewUint(gpu_handle, cpu_only, &host_res, &v, rects),
+                ClearUavValues::Float(v) => list
+                    .list
+                    .ClearUnorderedAccessViewFloat(gpu_handle, cpu_only, &host_res, &v, rects),
+            }
+            list.list
+                .ResourceBarrier(&[crate::host::uav_barrier(&host_res)]);
+        }
+    });
+}
+
+/// Slot 53 (`0x1a8`): `ClearUnorderedAccessViewUint`.
+extern "system" fn clear_uav_uint(
+    this: This,
+    view_gpu: u64,
+    view_cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: caller provides 4 clear values when clearing a UAV.
+        let Some(v) = (unsafe { values.as_ref() }).copied() else {
+            return;
+        };
+        clear_uav(this, view_gpu, view_cpu, resource, ClearUavValues::Uint(v), count, rects);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, view_gpu, view_cpu, resource, values, count, rects);
+}
+
+/// Slot 54 (`0x1b0`): `ClearUnorderedAccessViewFloat`.
+extern "system" fn clear_uav_float(
+    this: This,
+    view_gpu: u64,
+    view_cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: caller provides 4 clear values when clearing a UAV.
+        let Some(v) = (unsafe { values.as_ref() }).copied() else {
+            return;
+        };
+        clear_uav(
+            this,
+            view_gpu,
+            view_cpu,
+            resource,
+            ClearUavValues::Float(v),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, view_gpu, view_cpu, resource, values, count, rects);
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct DiscardRegion {
+    num_rects: u32,
+    rects: *const Rect,
+    first_subresource: u32,
+    num_subresources: u32,
+}
+
+#[cfg(windows)]
+const _: () = assert!(
+    size_of::<DiscardRegion>()
+        == size_of::<windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION>()
+);
+
+/// Slot 55 (`0x1b8`): `DiscardResource(resource, region)`. D3D12 treats discard
+/// as an optional optimization hint; preserving prior contents avoids
+/// invalidating mirrored host resource state.
+extern "system" fn discard_resource(_: This, resource: This, region: *const DiscardRegion) {
+    tracing::debug!(?resource, has_region = !region.is_null(), "discard resource ignored");
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -1399,7 +1568,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 55] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1440,6 +1609,9 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
+    (55, discard_resource as *const ()),          // 0x1b8
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1560,5 +1732,740 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    mod uav_tests {
+        use super::*;
+        use crate::object::guid;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAG_NONE, D3D12_BUFFER_UAV_FLAG_RAW,
+            D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_TEX2D_UAV, D3D12_TEXTURE_COPY_LOCATION,
+            D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            D3D12_UAV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_TEXTURE2D,
+            D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC_0,
+            ID3D12Resource,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN,
+            DXGI_SAMPLE_DESC,
+        };
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TestHeapProps {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TestResDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TestDescHeapDesc {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            nodes: u32,
+        }
+
+        const _: () = assert!(
+            size_of::<TestHeapProps>() == size_of::<crate::resource::HeapProperties>()
+        );
+        const _: () = assert!(
+            size_of::<TestResDesc>() == size_of::<crate::resource::ResourceDesc>()
+        );
+        const _: () = assert!(
+            size_of::<TestDescHeapDesc>() == size_of::<crate::descriptor::HeapDesc>()
+        );
+
+        type CloseFn = extern "system" fn(This) -> HRESULT;
+        type ExecuteFn = unsafe extern "system" fn(This, u32, *const This);
+        type ResetFn = extern "system" fn(This, This, This) -> HRESULT;
+        type SetHeapsFn = unsafe extern "system" fn(This, u32, *const This);
+        type ClearUintFn =
+            unsafe extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const Rect);
+        type ClearFloatFn =
+            unsafe extern "system" fn(This, u64, u64, This, *const [f32; 4], u32, *const Rect);
+        type DiscardFn = unsafe extern "system" fn(This, This, *const DiscardRegion);
+
+        struct UavFixture {
+            host: &'static crate::host::Host,
+            queue: This,
+            allocator: This,
+            title_list: This,
+            desc_heap: This,
+            heap_start: u64,
+            owned: Vec<This>,
+        }
+
+        impl UavFixture {
+            fn new(heap_count: u32) -> Option<Self> {
+                let host = crate::host::host()?;
+                let null: This = std::ptr::null();
+                let queue_iid = guid(
+                    0x0ec870a6,
+                    0x5d7e,
+                    0x4c22,
+                    [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+                );
+                let heap_iid = guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                );
+                let queue_desc = [0u32; 4];
+                let mut queue = null;
+                let mut allocator = null;
+                let mut title_list = null;
+                let mut desc_heap = null;
+                assert_eq!(
+                    crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+                    S_OK
+                );
+                assert_eq!(
+                    create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                    S_OK
+                );
+                assert_eq!(
+                    create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut title_list),
+                    S_OK
+                );
+                let heap_desc = TestDescHeapDesc {
+                    kind: 0,
+                    count: heap_count,
+                    flags: 1,
+                    nodes: 0,
+                };
+                assert_eq!(
+                    crate::descriptor::create_heap(
+                        null,
+                        (&raw const heap_desc).cast(),
+                        &heap_iid,
+                        &mut desc_heap,
+                    ),
+                    S_OK
+                );
+                let heap_start = slot::<extern "system" fn(This) -> u64>(desc_heap, 0x48)(desc_heap);
+                Some(Self {
+                    host,
+                    queue,
+                    allocator,
+                    title_list,
+                    desc_heap,
+                    heap_start,
+                    owned: Vec::new(),
+                })
+            }
+
+            fn create_res(
+                &mut self,
+                dimension: u32,
+                width: u64,
+                height: u32,
+                format: u32,
+                layout: u32,
+                flags: u32,
+            ) -> This {
+                let props = TestHeapProps {
+                    kind: 1,
+                    cpu_pages: 0,
+                    pool: 0,
+                    creation_nodes: 0,
+                    visible_nodes: 0,
+                };
+                let desc = TestResDesc {
+                    dimension,
+                    alignment: 0,
+                    width,
+                    height,
+                    depth_or_array_size: 1,
+                    mip_levels: 1,
+                    format,
+                    sample_count: 1,
+                    sample_quality: 0,
+                    layout,
+                    flags,
+                };
+                let res_iid = guid(
+                    0x696442be,
+                    0xa72e,
+                    0x4059,
+                    [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+                );
+                let mut out = std::ptr::null();
+                assert_eq!(
+                    crate::resource::create_committed(
+                        std::ptr::null(),
+                        (&raw const props).cast(),
+                        0,
+                        (&raw const desc).cast(),
+                        0,
+                        std::ptr::null(),
+                        &res_iid,
+                        &mut out,
+                    ),
+                    S_OK
+                );
+                self.owned.push(out);
+                out
+            }
+
+            fn make_uav(
+                &self,
+                slot_idx: u64,
+                res: This,
+                desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+            ) -> u64 {
+                let handle = self.heap_start + slot_idx * 32;
+                // SAFETY: 40-byte D3D12_UNORDERED_ACCESS_VIEW_DESC matches `[u32; 10]`.
+                let words: [u32; 10] = unsafe { std::mem::transmute(desc) };
+                crate::descriptor::create_uav(
+                    std::ptr::null(),
+                    res,
+                    std::ptr::null(),
+                    &words,
+                    handle,
+                );
+                handle
+            }
+
+            fn bind_heap(&self) {
+                // SAFETY: live command list and descriptor heap.
+                unsafe {
+                    slot::<SetHeapsFn>(self.title_list, 0x100)(
+                        self.title_list,
+                        1,
+                        &self.desc_heap,
+                    );
+                }
+            }
+
+            fn submit_and_reset(&self) {
+                assert_eq!(slot::<CloseFn>(self.title_list, 0x48)(self.title_list), S_OK);
+                // SAFETY: live queue, command list, and allocator.
+                unsafe { slot::<ExecuteFn>(self.queue, 0x50)(self.queue, 1, &self.title_list) };
+                assert_eq!(
+                    slot::<ResetFn>(self.title_list, 0x50)(
+                        self.title_list,
+                        self.allocator,
+                        std::ptr::null(),
+                    ),
+                    S_OK
+                );
+            }
+
+            fn read_rgba_4x4(&self, tex: This) -> Vec<u8> {
+                let host_tex = crate::resource::host_resource(tex).expect("host texture");
+                let (_, before) = crate::resource::host_transition(tex, 0x800).unwrap();
+                let mut rb: Option<ID3D12Resource> = None;
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 4 * 256,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: creates host readback buffer and reads `host_tex`.
+                unsafe {
+                    self.host
+                        .device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut rb,
+                        )
+                        .unwrap();
+                }
+                let rb = rb.unwrap();
+                let back = self.host.new_list().unwrap();
+                let mut dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(rb.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: windows::Win32::Graphics::Direct3D12::D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let mut src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(host_tex.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                // SAFETY: live readback list and live texture/readback resources.
+                unsafe {
+                    back.list.ResourceBarrier(&[crate::host::transition(
+                        host_tex,
+                        windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    back.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                    back.list.ResourceBarrier(&[crate::host::transition(
+                        host_tex,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                    std::mem::ManuallyDrop::drop(&mut dst.pResource);
+                    std::mem::ManuallyDrop::drop(&mut src.pResource);
+                }
+                let _ = crate::resource::host_transition(tex, D3D12_RESOURCE_STATE_COMMON.0 as u32);
+                back.close();
+                self.host.execute(&[&back]);
+                let mut ptr = std::ptr::null_mut();
+                // SAFETY: readback buffer finished GPU copy cleanly.
+                unsafe { rb.Map(0, None, Some(&mut ptr)).unwrap() };
+                // SAFETY: mapped 1024 readback bytes.
+                unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), 4 * 256) }.to_vec()
+            }
+        }
+
+        impl Drop for UavFixture {
+            fn drop(&mut self) {
+                let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+                for obj in self.owned.drain(..) {
+                    let _ = release(obj);
+                }
+                for obj in [self.desc_heap, self.title_list, self.allocator, self.queue] {
+                    let _ = release(obj);
+                }
+            }
+        }
+
+        #[test]
+        fn clear_uav_uint_and_float_clear_textures_and_buffers() {
+            let Some(mut f) = UavFixture::new(16) else {
+                return;
+            };
+            let list = f.title_list;
+
+            // 1. RGBA8_UNORM texture (`28`, flags=4): full + partial RECT ClearFloat (slot 54).
+            // Intentional test without calling `SetDescriptorHeaps` first to exercise `ensure_view_heap`.
+            let tex_rgba = f.create_res(3, 4, 4, 28, 0, 4);
+            let uav_rgba = f.make_uav(
+                0,
+                tex_rgba,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_UAV::default(),
+                    },
+                },
+            );
+            let outer = [1.0f32, 0.0, 0.0, 1.0];
+            let inner_color = [0.0f32, 1.0, 0.0, 1.0];
+            let inner = Rect {
+                left: 1,
+                top: 1,
+                right: 3,
+                bottom: 3,
+            };
+            // SAFETY: open command list, live texture and UAV descriptors.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav_rgba,
+                    uav_rgba,
+                    tex_rgba,
+                    &outer,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav_rgba,
+                    uav_rgba,
+                    tex_rgba,
+                    &inner_color,
+                    1,
+                    &inner,
+                );
+            }
+            f.submit_and_reset();
+
+            let rgba = f.read_rgba_4x4(tex_rgba);
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    let px = &rgba[y * 256 + x * 4..y * 256 + x * 4 + 4];
+                    let expected = if (1..3).contains(&x) && (1..3).contains(&y) {
+                        [0, 255, 0, 255]
+                    } else {
+                        [255, 0, 0, 255]
+                    };
+                    assert_eq!(px, &expected, "texel ({x}, {y})");
+                }
+            }
+
+            // 2. Raw + Structured + Placed buffer ClearUint (slot 53) and DiscardResource (slot 55).
+            let buf = f.create_res(1, 1024, 1, 0, 1, 4);
+            let (buf_ptr, buf_size) = crate::resource::buffer_bytes(buf).unwrap();
+            assert_eq!(buf_size, 1024);
+            // SAFETY: 256 u32 words in title buffer memory.
+            let buf_words = unsafe { std::slice::from_raw_parts_mut(buf_ptr.cast::<u32>(), 256) };
+            buf_words.fill(0xdead_beef);
+            let uav_raw = f.make_uav(
+                1,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 16,
+                            NumElements: 8,
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                },
+            );
+            let uav_struct = f.make_uav(
+                2,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 4,
+                            NumElements: 2,
+                            StructureByteStride: 32,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                        },
+                    },
+                },
+            );
+            let addr = buf_ptr as u64;
+            let placed_res = [1u32, 0, 0, 0, 1024, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let placed_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 16,
+                        NumElements: 4,
+                        StructureByteStride: 16,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                    },
+                },
+            };
+            // SAFETY: 40-byte D3D12_UNORDERED_ACCESS_VIEW_DESC matches `[u32; 10]`.
+            let placed_prefix: [u32; 10] = unsafe { std::mem::transmute(placed_uav) };
+            let mut placed_desc = [0u32; 16];
+            placed_desc[..10].copy_from_slice(&placed_prefix);
+            placed_desc[10] = addr as u32;
+            placed_desc[11] = (addr >> 32) as u32;
+            let uav_placed = f.heap_start + 3 * 32;
+            crate::descriptor::create_placed_uav(
+                std::ptr::null(),
+                &placed_res,
+                &placed_desc,
+                uav_placed,
+            );
+
+            let raw_val = [0x1122_3344u32, 0, 0, 0];
+            let struct_val = [0x5566_7788u32, 0, 0, 0];
+            let placed_val = [0x99aa_bbccu32, 0, 0, 0];
+            let discard_region = DiscardRegion {
+                num_rects: 1,
+                rects: &inner,
+                first_subresource: 0,
+                num_subresources: 1,
+            };
+            f.bind_heap();
+            // SAFETY: open list, live buffers, UAV descriptors, and discard hints.
+            unsafe {
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_raw,
+                    uav_raw,
+                    buf,
+                    &raw_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_struct,
+                    uav_struct,
+                    buf,
+                    &struct_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_placed,
+                    uav_placed,
+                    std::ptr::null(),
+                    &placed_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<DiscardFn>(list, 0x1b8)(list, tex_rgba, std::ptr::null());
+                slot::<DiscardFn>(list, 0x1b8)(list, buf, &discard_region);
+            }
+            f.submit_and_reset();
+
+            assert!(buf_words[..16].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[16..24].iter().all(|&w| w == 0x1122_3344));
+            assert!(buf_words[24..32].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[32..48].iter().all(|&w| w == 0x5566_7788));
+            assert!(buf_words[48..64].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[64..80].iter().all(|&w| w == 0x99aa_bbcc));
+            assert!(buf_words[80..].iter().all(|&w| w == 0xdead_beef));
+            // SAFETY: live device query.
+            assert!(unsafe { f.host.device.GetDeviceRemovedReason() }.is_ok());
+        }
+
+        #[test]
+        fn clear_uav_releases_dynamic_slots_on_list_reset() {
+            let Some(mut f) = UavFixture::new(8) else {
+                return;
+            };
+            let list = f.title_list;
+            let buf = f.create_res(1, 512, 1, 0, 1, 4);
+            let uav = f.make_uav(
+                0,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 0,
+                            NumElements: 16,
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                },
+            );
+            f.bind_heap();
+            let host_heap = crate::descriptor::heap(f.desc_heap).host().unwrap();
+            let used_before = host_heap.dynamic_used();
+            let val = [0x1234_5678u32, 0, 0, 0];
+            // SAFETY: open list, live buffer and UAV descriptor.
+            unsafe {
+                for _ in 0..3 {
+                    slot::<ClearUintFn>(list, 0x1a8)(list, uav, uav, buf, &val, 0, std::ptr::null());
+                }
+            }
+            assert_eq!(host_heap.dynamic_used(), used_before + 3);
+            f.submit_and_reset();
+            assert_eq!(host_heap.dynamic_used(), used_before);
+        }
+
+        #[test]
+        fn clear_uav_uint_handles_non_16b_aligned_offsets_and_refuses_float_raw() {
+            let Some(mut f) = UavFixture::new(8) else {
+                return;
+            };
+            let list = f.title_list;
+            let buf = f.create_res(1, 512, 1, 0, 1, 4);
+            let (buf_ptr, _) = crate::resource::buffer_bytes(buf).unwrap();
+            // SAFETY: 128 u32 words in title buffer memory.
+            let buf_words = unsafe { std::slice::from_raw_parts_mut(buf_ptr.cast::<u32>(), 128) };
+            buf_words.fill(0xdead_beef);
+            // Byte offset 8 (`FirstElement = 2`), not 16-byte aligned: works via `R32_UINT`.
+            let uav_raw = f.make_uav(
+                0,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 2,
+                            NumElements: 3,
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                },
+            );
+            // Byte offset 36 (`3 * 12`), non-16B-aligned structured window (dwords 9..15).
+            let uav_struct = f.make_uav(
+                1,
+                buf,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 3,
+                            NumElements: 2,
+                            StructureByteStride: 12,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                        },
+                    },
+                },
+            );
+            let raw_val = [0x1122_3344u32, 0, 0, 0];
+            let struct_val = [0x5566_7788u32, 0, 0, 0];
+            let float_val = [1.0f32, 0.0, 0.0, 1.0];
+            f.bind_heap();
+            // SAFETY: open list, live buffer, and UAV descriptors.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav_raw,
+                    uav_raw,
+                    buf,
+                    &float_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav_struct,
+                    uav_struct,
+                    buf,
+                    &float_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_raw,
+                    uav_raw,
+                    buf,
+                    &raw_val,
+                    0,
+                    std::ptr::null(),
+                );
+                slot::<ClearUintFn>(list, 0x1a8)(
+                    list,
+                    uav_struct,
+                    uav_struct,
+                    buf,
+                    &struct_val,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            f.submit_and_reset();
+
+            assert!(buf_words[..2].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[2..5].iter().all(|&w| w == 0x1122_3344));
+            assert!(buf_words[5..9].iter().all(|&w| w == 0xdead_beef));
+            assert!(buf_words[9..15].iter().all(|&w| w == 0x5566_7788));
+            assert!(buf_words[15..].iter().all(|&w| w == 0xdead_beef));
+            // SAFETY: live device query.
+            assert!(unsafe { f.host.device.GetDeviceRemovedReason() }.is_ok());
+        }
+
+        #[test]
+        fn clear_uav_defers_texture_host_written_until_submit() {
+            let Some(mut f) = UavFixture::new(4) else {
+                return;
+            };
+            let list = f.title_list;
+            let tex = f.create_res(3, 4, 4, 28, 0, 4);
+            let uav = f.make_uav(
+                0,
+                tex,
+                D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_UAV::default(),
+                    },
+                },
+            );
+            let color = [0.0f32, 0.0, 1.0, 1.0];
+            // Record ClearFloat and reset WITHOUT submitting: texture must NOT be host_written.
+            // SAFETY: open list, live texture, and UAV descriptor.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav,
+                    uav,
+                    tex,
+                    &color,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            assert!(!crate::texture::is_host_written(tex));
+            assert_eq!(slot::<CloseFn>(list, 0x48)(list), S_OK);
+            assert_eq!(
+                slot::<ResetFn>(list, 0x50)(list, f.allocator, std::ptr::null()),
+                S_OK
+            );
+            assert!(!crate::texture::is_host_written(tex));
+
+            // Record again and submit: texture becomes `host_written` with expected pixels.
+            // SAFETY: open list, live texture, and UAV descriptor.
+            unsafe {
+                slot::<ClearFloatFn>(list, 0x1b0)(
+                    list,
+                    uav,
+                    uav,
+                    tex,
+                    &color,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+            f.submit_and_reset();
+            assert!(crate::texture::is_host_written(tex));
+            let rgba = f.read_rgba_4x4(tex);
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    let px = &rgba[y * 256 + x * 4..y * 256 + x * 4 + 4];
+                    assert_eq!(px, &[0, 0, 255, 255], "texel ({x}, {y})");
+                }
+            }
+        }
     }
 }

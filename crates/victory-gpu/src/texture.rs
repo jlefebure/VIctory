@@ -76,6 +76,15 @@ pub(crate) fn host_written(resource: This) {
         .insert(resource as usize);
 }
 
+#[cfg(test)]
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());

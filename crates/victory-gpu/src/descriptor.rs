@@ -129,6 +129,13 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     Some((heap, heap.index(handle)?))
 }
 
+/// The shader-visible view heap holding `handle`, if one does.
+#[cfg(windows)]
+pub(crate) fn view_heap_for(handle: u64) -> Option<usize> {
+    let (heap, _) = shader_slot(handle)?;
+    (!heap.samplers()).then_some(std::ptr::from_ref(heap) as usize)
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
 #[cfg(windows)]
