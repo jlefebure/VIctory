@@ -116,17 +116,49 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // Diagnostics: `VICTORY_DUMP_FAILED=<dir>` keeps the
+                        // container, for `victory shader-info --disasm`.
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(dir) = failed_dump_dir() {
+                            let path = dir.join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            if let Err(e) = std::fs::write(&path, &self.container) {
+                                tracing::warn!(path = %path.display(), error = %e, "VICTORY_DUMP_FAILED: not written");
+                            }
+                        }
+                    }
                 }
                 done.ok()
             })
             .as_ref()
     }
+}
+
+/// The folder `VICTORY_DUMP_FAILED` names, made once and checked to be
+/// outside every source tree (the containers are title data). `None` when
+/// unset or refused, which is logged.
+#[cfg(feature = "diagnostics")]
+fn failed_dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_DUMP_FAILED")?);
+        if let Err(e) = victory_core::ensure_outside_repo(&dir) {
+            tracing::warn!(error = %e, "VICTORY_DUMP_FAILED: refused, nothing is dumped");
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "VICTORY_DUMP_FAILED: no folder, nothing is dumped");
+            return None;
+        }
+        Some(dir)
+    })
+    .as_deref()
 }
 
 #[cfg(windows)]
@@ -149,6 +181,29 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+/// Diagnostics: the console resources each stage of pipeline `this` uses
+/// (stage, shader hash, resources), whether or not its shaders translate.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn native_used(this: This) -> Vec<(&'static str, String, Vec<victory_shader::UsedResource>)> {
+    use victory_shader::{Container, FourCC};
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .map(|s| {
+            let used = Container::parse(&s.container)
+                .ok()
+                .and_then(|c| c.part(FourCC::DXIL).map(|p| p.data.to_vec()))
+                .and_then(|d| victory_shader::native_programs(&d).ok())
+                .map(|programs| programs.into_iter().flat_map(|p| p.used).collect())
+                .unwrap_or_default();
+            (s.stage, s.hash.clone(), used)
+        })
+        .collect()
 }
 
 #[repr(C)]
