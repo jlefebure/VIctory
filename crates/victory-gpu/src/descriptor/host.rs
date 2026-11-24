@@ -111,8 +111,15 @@ impl HostHeap {
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    // One frame of the title's lists needs more than 2^16
+                    // dynamic slots (about a hundred lists of ~600 each), so
+                    // a capped heap keeps the full dynamic range; the title
+                    // slots past it are made afresh per table, like those
+                    // past the host's limit (NVIDIA takes no more than
+                    // 1,000,000 views).
+                    let title = PORTABLE_VIEWS - DYNAMIC;
+                    tracing::warn!(error = %e, count, title, "host view heap capped at {PORTABLE_VIEWS}");
+                    (make(PORTABLE_VIEWS).ok()?, title, DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -250,6 +257,23 @@ impl HostHeap {
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            #[cfg(feature = "diagnostics")]
+            {
+                static FAILS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let k = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if k.is_power_of_two() {
+                    let held = taken.iter().filter(|&&t| t).count();
+                    let holders = crate::draw::HOLDERS.load(std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        fails = k,
+                        n,
+                        held,
+                        total = self.dynamic,
+                        holders,
+                        "dynamic slots exhausted"
+                    );
+                }
+            }
             return None;
         };
         taken[first..first + n].fill(true);
