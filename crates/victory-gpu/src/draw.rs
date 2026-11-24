@@ -208,6 +208,27 @@ fn fallback_root_va(uav: bool) -> Option<u64> {
     .map(|&(_, gpu)| gpu)
 }
 
+/// A transition of all of `buffer` from `from` to `to` (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn uav_then(
+    buffer: &ID3D12Resource,
+    from: D3D12_RESOURCE_STATES,
+    to: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(Some(buffer.clone())),
+                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                StateBefore: from,
+                StateAfter: to,
+            }),
+        },
+    }
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. Constant buffers refresh up to the D3D12 64 KiB
@@ -1515,6 +1536,36 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // Diagnostics, in captured frames: the records as the title's passes
+        // left them, before the clamp.
+        #[cfg(feature = "diagnostics")]
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && crate::capture::listed(crate::queue::presented() + 1)
+            && let Some(host) = crate::host::host()
+        {
+            let bytes = (u64::from(stride) * u64::from(max.clamp(1, 8))).min(len);
+            if let Some((rb, at)) = host.readback_buffer(bytes) {
+                // SAFETY: an open list; the arguments buffer is in the
+                // unordered-access state between title passes.
+                unsafe {
+                    let l = &list.list;
+                    l.ResourceBarrier(&[uav_then(&args.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    l.CopyBufferRegion(&rb, 0, &args.buffer, args.offset(arguments), bytes);
+                    l.ResourceBarrier(&[uav_then(&args.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                }
+                list.keep(&rb);
+                let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map_or_else(|| "no pipeline".to_owned(), |p| p.name.clone());
+                list.defer_arg_log(
+                    format!(
+                        "BEFORE frame {} kind {kind} at {arguments:#x} ({arguments}) {name}",
+                        crate::queue::presented() + 1
+                    ),
+                    at,
+                    bytes as usize,
+                );
+            }
+        }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -1526,6 +1577,55 @@ impl State {
                 Some("not bounded (no clamp, or arguments not 4-byte aligned)"),
             );
             return false;
+        }
+        // Diagnostics, in captured frames: the clamped records as the GPU
+        // runs them, logged once the list has run.
+        #[cfg(feature = "diagnostics")]
+        if tracing::enabled!(tracing::Level::DEBUG)
+            && crate::capture::listed(crate::queue::presented() + 1)
+            && let Some(host) = crate::host::host()
+        {
+            let bytes = (u64::from(stride) * u64::from(max.clamp(1, 8))).min(len);
+            if let Some((rb, at)) = host.readback_buffer(bytes) {
+                let name = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map_or_else(|| "no pipeline".to_owned(), |p| p.name.clone());
+                // SAFETY: an open list; the arguments buffer is in the
+                // indirect-argument state after the clamp, and back after.
+                unsafe {
+                    let l = &list.list;
+                    let state = |from, to| D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                                pResource: std::mem::ManuallyDrop::new(Some(args.buffer.clone())),
+                                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                StateBefore: from,
+                                StateAfter: to,
+                            }),
+                        },
+                    };
+                    l.ResourceBarrier(&[state(
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    l.CopyBufferRegion(&rb, 0, &args.buffer, args.offset(arguments), bytes);
+                    l.ResourceBarrier(&[state(
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                }
+                list.keep(&rb);
+                list.defer_arg_log(
+                    format!(
+                        "frame {} kind {kind} stride {stride} max {max} count {} {name}",
+                        crate::queue::presented() + 1,
+                        counter.is_some()
+                    ),
+                    at,
+                    bytes as usize,
+                );
+            }
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;

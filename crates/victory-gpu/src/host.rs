@@ -437,6 +437,10 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Indirect arguments read back for the log once the list has run:
+    /// what they are for, the mapped readback copy, its bytes.
+    #[cfg(feature = "diagnostics")]
+    arg_logs: Vec<(String, usize, usize)>,
 }
 
 impl Host {
@@ -701,6 +705,17 @@ impl Host {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        for list in runs {
+            for (what, at, bytes) in &list.deferred().arg_logs {
+                // SAFETY: a mapped readback buffer of `bytes` bytes the list
+                // keeps, written by the submission that has completed.
+                let words: Vec<u32> = (0..bytes / 4)
+                    .map(|k| unsafe { (*at as *const u32).add(k).read_unaligned() })
+                    .collect();
+                tracing::info!("indirect arguments after the clamp: {what}: {words:?}");
+            }
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
@@ -1319,6 +1334,13 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
+    }
+
+    /// Logs the `bytes` bytes of mapped readback memory at `at` once the
+    /// list has run (diagnostics: indirect arguments as the GPU used them).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_arg_log(&self, what: String, at: *const u8, bytes: usize) {
+        self.deferred().arg_logs.push((what, at as usize, bytes));
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
