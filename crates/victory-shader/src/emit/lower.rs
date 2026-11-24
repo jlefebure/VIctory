@@ -473,12 +473,12 @@ impl<'a> Lower<'a> {
             // for a group of one console wave without LDS.
             // Whole-wave sections (reductions, prefix sums) run per half
             // there, the halves' results exchanged and combined (`shape`).
+            // LDS too: its writes get group barriers there (`lds_sync`).
             wants_console_flow = console_lanes
                 && !split
                 && x.native.wave64
                 && !x.target.runs(64)
                 && x.target.runs(32)
-                && s.lds_dwords == 0
                 && cs.threads.iter().product::<u32>() <= 64
                 && !insts().any(|i| i.name().contains("permute"));
             if x.console_cf {
@@ -512,6 +512,23 @@ impl<'a> Lower<'a> {
                             || uniform(x.st.reach[b]) && x.st.guards[b][i].is_none_or(uniform)
                     })
                 });
+            // The console flow takes every lane through every block, so its
+            // barriers may go around any LDS write (the write itself stays
+            // guarded per lane).
+            if x.console_cf && s.lds_dwords > 0 {
+                lds_sync = true;
+            } else if !lds_sync
+                && !console_lanes
+                && x.native.wave64
+                && one_wave
+                && s.lds_dwords > 0
+                && !x.target.runs(64)
+                && x.target.runs(32)
+            {
+                // LDS written under per-lane conditions: barriers there need
+                // the console flow's every-lane blocks.
+                wants_console_flow = true;
+            }
             if split {
                 s.wave_size = Some(32);
             } else if lds_sync {
