@@ -100,6 +100,7 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         console_waves: false,
+        stride_table: lowered.stride_table,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
